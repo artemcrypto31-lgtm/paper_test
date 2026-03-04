@@ -24,6 +24,8 @@ from telebot import types
 from datetime import datetime
 from dotenv import load_dotenv
 from backtesting import Backtest, Strategy
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
 
 # =====================================================================
 # КОНФИГУРАЦИЯ
