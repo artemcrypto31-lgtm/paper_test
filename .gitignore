@@ -1,6 +1,5 @@
-*.db
-__pycache__/
-*.pyc
-.vscode/
+venv/
 .env
 paper_trading.db
+__pycache__/
+*.pyc
