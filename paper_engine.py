@@ -1,12 +1,15 @@
 """
-Fortress Paper Trading Bot V4.3
+Fortress Paper Trading Bot V4.4
 =================================
-Изменения по сравнению с V4.2:
-  - MACD сканер переведён с 30м на 1ч таймфрейм
-  - Вотч-лист убран из EMA/MACD сканеров — отдельный цикл раз в час
-    (ровно в начале каждого часа, 1 уведомление)
-  - Кнопка 🚪 ЗАКРЫТЬ ВСЕ СДЕЛКИ — закрывает все по текущей цене
-  - Исправлен cmd_trades: добавлен send_message в конце функции
+Изменения по сравнению с V4.3:
+  - MACD: добавлены фиксированные SL и TP на основе ATR
+    SL = ATR × 1.5 | TP = ATR × 3.75 | RR = 1:2.5
+  - MACD: убран аварийный стоп 15% — теперь есть реальный SL
+  - MACD: добавлен лимит MAX_MACD_TRADES (макс. открытых MACD сделок)
+  - MACD: мониторинг SL/TP теперь в monitor_trades (как EMA)
+  - EMA: добавлен лимит MAX_EMA_TRADES (макс. открытых EMA сделок)
+  - cmd_trades: убран лишний запрос к БД (size берётся из основного SELECT)
+  - cmd_trades: добавлена дата открытия сделки
 """
 
 import asyncio
@@ -44,6 +47,14 @@ REWARD_RATIO      = 2.5       # TP = SL × 2.5  (для EMA Cross)
 ATR_MULT_SL       = 2.0       # SL = ATR × 2.0 (для EMA Cross)
 MONITOR_INTERVAL  = 60        # Проверка сделок каждые 60 сек
 RADAR_INTERVAL    = 7200      # Радар каждые 2 часа
+
+# Лимиты открытых сделок
+MAX_EMA_TRADES    = 5         # Макс. одновременных EMA сделок
+MAX_MACD_TRADES   = 5         # Макс. одновременных MACD сделок
+
+# MACD параметры SL/TP (ATR-based, RR = 1:2.5)
+MACD_ATR_SL       = 1.5       # SL = ATR × 1.5
+MACD_ATR_TP       = 3.75      # TP = ATR × 3.75
 
 # Сетка запусков сканеров
 EMA_GRID_MINUTES  = 15        # EMA Cross: каждые 15 мин по сетке
@@ -558,9 +569,9 @@ def analyze_symbol_macd(symbol: str):
     bear_cross = ml.iloc[-3] > sl.iloc[-3] and ml.iloc[-2] < sl.iloc[-2]
 
     if bull_cross:
-        return {'symbol': symbol, 'price': c.iloc[-2], 'side': 'long'}
+        return {'symbol': symbol, 'price': c.iloc[-2], 'side': 'long', 'atr': atr_val}
     if bear_cross:
-        return {'symbol': symbol, 'price': c.iloc[-2], 'side': 'short'}
+        return {'symbol': symbol, 'price': c.iloc[-2], 'side': 'short', 'atr': atr_val}
     return None
 
 # =====================================================================
@@ -649,6 +660,14 @@ def open_trade_ema(symbol: str, price: float, atr_val: float) -> bool:
     except (ccxt.NetworkError, ccxt.ExchangeError):
         pass
 
+    # Лимит открытых EMA сделок
+    ema_count = _read_db(
+        'SELECT COUNT(*) FROM active_trades WHERE macd_active=0',
+        fetchone=True)[0]
+    if ema_count >= MAX_EMA_TRADES:
+        print(f'[EMA] Лимит {MAX_EMA_TRADES} сделок достигнут — пропуск {symbol}')
+        return False
+
     balance = _read_db('SELECT balance FROM wallet', fetchone=True)[0]
     trades  = _read_db('SELECT symbol,side,entry_price,size FROM active_trades')
     unrealized = 0.0
@@ -691,9 +710,17 @@ def open_trade_ema(symbol: str, price: float, atr_val: float) -> bool:
 # =====================================================================
 # ОТКРЫТИЕ СДЕЛКИ — MACD
 # =====================================================================
-def open_trade_macd(symbol: str, price: float, side: str) -> bool:
+def open_trade_macd(symbol: str, price: float, side: str, atr_val: float) -> bool:
     if _read_db('SELECT 1 FROM active_trades WHERE symbol=?',
                 (symbol,), fetchone=True):
+        return False
+
+    # Лимит открытых MACD сделок
+    macd_count = _read_db(
+        'SELECT COUNT(*) FROM active_trades WHERE macd_active=1',
+        fetchone=True)[0]
+    if macd_count >= MAX_MACD_TRADES:
+        print(f'[MACD] Лимит {MAX_MACD_TRADES} сделок достигнут — пропуск {symbol}')
         return False
 
     balance = _read_db('SELECT balance FROM wallet', fetchone=True)[0]
@@ -706,8 +733,19 @@ def open_trade_macd(symbol: str, price: float, side: str) -> bool:
         except Exception:
             pass
     equity = balance + unrealized
-    # Риск 1% от equity / аварийный стоп 15%
-    size = (equity * RISK_PER_TRADE) / (price * 0.15)
+
+    # SL и TP на основе ATR (RR = 1:2.5)
+    sl_dist = atr_val * MACD_ATR_SL
+    tp_dist = atr_val * MACD_ATR_TP
+    if side == 'long':
+        sl = price - sl_dist
+        tp = price + tp_dist
+    else:
+        sl = price + sl_dist
+        tp = price - tp_dist
+
+    # Размер позиции: риск 1% от equity / дистанция SL
+    size = (equity * RISK_PER_TRADE) / sl_dist
 
     try:
         _write_db_sync(
@@ -715,8 +753,8 @@ def open_trade_macd(symbol: str, price: float, side: str) -> bool:
             '(symbol,side,entry_price,size,sl,tp,'
             ' is_trailing,trailing_sl,partial_price,'
             ' entry_time,entry_balance,scanner,macd_active) '
-            'VALUES (?,?,?,?,NULL,NULL,0,NULL,NULL,?,?,?,1)',
-            (symbol, side, price, size,
+            'VALUES (?,?,?,?,?,?,0,NULL,NULL,?,?,?,1)',
+            (symbol, side, price, size, sl, tp,
              datetime.now().strftime('%Y-%m-%d %H:%M:%S'), balance, 'macd')
         )
     except Exception as e:
@@ -727,7 +765,8 @@ def open_trade_macd(symbol: str, price: float, side: str) -> bool:
     bot.send_message(USER_ID,
         f'{icon} *MACD ВХОД: {symbol}*\n'
         f'Тип: *{side.upper()}* | Цена: `{price:.6g}`\n'
-        f'Выход: по обратному MACD сигналу',
+        f'🔴 SL: `{sl:.6g}` | 🎯 TP: `{tp:.6g}`\n'
+        f'📏 R:R: `1 : 2.5` | Риск: `{equity * RISK_PER_TRADE:.2f}` USDT',
         parse_mode='Markdown'
     )
     return True
@@ -789,15 +828,27 @@ async def monitor_trades():
                  entry_time, entry_balance, scanner, macd_active) = trade
 
                 if macd_active:
-                    # Аварийный стоп для MACD если убыток > 15% от цены входа
+                    # MACD сделки — мониторим SL и TP как обычные сделки
                     try:
-                        cur_price = exchange.fetch_ticker(symbol)['last']
+                        cur_price   = exchange.fetch_ticker(symbol)['last']
+                        candles_1m  = exchange.fetch_ohlcv(symbol, '1m', limit=2)
+                        c_low       = candles_1m[-2][3]
+                        c_high      = candles_1m[-2][2]
+
                         if side == 'long':
-                            loss_pct = (entry_price - cur_price) / entry_price * 100
-                        else:
-                            loss_pct = (cur_price - entry_price) / entry_price * 100
-                        if loss_pct > 15:
-                            close_trade(trade, cur_price, f'🚨 АВАРИЙНЫЙ СТОП -{loss_pct:.1f}%')
+                            sl_hit = cur_price <= sl or c_low  <= sl
+                            tp_hit = cur_price >= tp or c_high >= tp
+                            if sl_hit:
+                                close_trade(trade, min(cur_price, c_low), '🔴 STOP-LOSS')
+                            elif tp_hit:
+                                close_trade(trade, max(cur_price, c_high), '🎯 TAKE-PROFIT')
+                        else:  # short
+                            sl_hit = cur_price >= sl or c_high >= sl
+                            tp_hit = cur_price <= tp or c_low  <= tp
+                            if sl_hit:
+                                close_trade(trade, max(cur_price, c_high), '🔴 STOP-LOSS')
+                            elif tp_hit:
+                                close_trade(trade, min(cur_price, c_low), '🎯 TAKE-PROFIT')
                     except (ccxt.NetworkError, ccxt.ExchangeError):
                         pass
                     continue
@@ -969,7 +1020,7 @@ async def macd_hunter():
                     if setup and setup['side'] != side:
                         close_trade(trade, setup['price'], '🔄 MACD разворот')
                         closed += 1
-                        open_trade_macd(sym, setup['price'], setup['side'])
+                        open_trade_macd(sym, setup['price'], setup['side'], setup['atr'])
                 except (ccxt.NetworkError, ccxt.ExchangeError) as e:
                     print(f'[MACD Monitor] Сеть {sym}: {e}')
                 except Exception as e:
@@ -982,7 +1033,7 @@ async def macd_hunter():
                 try:
                     setup = analyze_symbol_macd(sym)
                     if setup:
-                        if open_trade_macd(sym, setup['price'], setup['side']):
+                        if open_trade_macd(sym, setup['price'], setup['side'], setup['atr']):
                             if setup['side'] == 'long':
                                 found_long += 1
                             else:
@@ -1299,22 +1350,25 @@ def cmd_trades(msg):
         return
     trades = _read_db(
         'SELECT symbol,side,entry_price,sl,tp,'
-        '       is_trailing,trailing_sl,entry_time,scanner,macd_active '
+        '       is_trailing,trailing_sl,entry_time,scanner,macd_active,size '
         'FROM active_trades'
     )
     if not trades:
         bot.send_message(USER_ID, '⚔️ Активных сделок нет.')
         return
     text = '⚔️ *АКТИВНЫЕ СДЕЛКИ:*\n\n'
-    for sym, side, ep, sl, tp, is_tr, tsl, et, scn, macd_a in trades:
-        t    = et[11:16] if et and len(et) >= 16 else '—'
+    for sym, side, ep, sl, tp, is_tr, tsl, et, scn, macd_a, sz in trades:
+        # Дата и время открытия
+        if et and len(et) >= 16:
+            dt_part = et[5:10]   # MM-DD
+            tm_part = et[11:16]  # HH:MM
+            t = f'{dt_part} {tm_part}'
+        else:
+            t = '—'
         icon = '📊' if scn == 'ema' else '📉'
 
-        # Текущий PnL — берём size прямо из БД
+        # Текущий PnL
         try:
-            row       = _read_db('SELECT size FROM active_trades WHERE symbol=?',
-                                 (sym,), fetchone=True)
-            sz        = row[0] if row else 0
             cur_price = exchange.fetch_ticker(sym)['last']
             cur_pnl   = (cur_price - ep) * sz if side == 'long' \
                         else (ep - cur_price) * sz
@@ -1324,7 +1378,11 @@ def cmd_trades(msg):
             pnl_str = ''
 
         if macd_a:
-            mode = '🔄 Выход по MACD сигналу'
+            if sl and tp:
+                mode = (f'🔴 SL: `{sl:.6g}` | 🎯 TP: `{tp:.6g}`\n  '
+                        f'📏 R:R: `1 : 2.5`')
+            else:
+                mode = '🔄 Выход по MACD сигналу'
         elif is_tr:
             mode = (f'📍 Трейлинг SL: `{tsl:.6g}`\n  '
                     f'🔴 SL: `{sl:.6g}`')
