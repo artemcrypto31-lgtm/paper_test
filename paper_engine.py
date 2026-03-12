@@ -1,23 +1,25 @@
 """
-Fortress Paper Trading Bot V4.3
+Fortress Paper Trading Bot V4.4
 =================================
-Изменения по сравнению с V4.2:
-  - MACD сканер переведён с 30м на 1ч таймфрейм
-  - Вотч-лист убран из EMA/MACD сканеров — отдельный цикл раз в час
-    (ровно в начале каждого часа, 1 уведомление)
-  - Кнопка 🚪 ЗАКРЫТЬ ВСЕ СДЕЛКИ — закрывает все по текущей цене
-  - Исправлен cmd_trades: добавлен send_message в конце функции
+Изменения по сравнению с V4.3:
+  - MACD: добавлены SL и TP на основе ATR (SL=ATR×1.5, TP=ATR×3.75, RR=1:2.5)
+  - MACD: убран аварийный стоп 15% — теперь есть реальный SL
+  - MACD: лимит MAX_MACD_TRADES одновременных сделок
+  - EMA: лимит MAX_EMA_TRADES одновременных сделок
+  - Бэктест: исправлена ошибка индикаторов (numpy→pd.Series wrapper)
+  - pandas_ta полностью заменён на чистые реализации (совместимость pandas 3.x)
+  - cmd_trades: size берётся из основного SELECT, добавлена дата открытия
 """
 
 import asyncio
 import math
 import sqlite3
 import os
+import numpy as np
 import telebot
 import threading
 import queue
 import pandas as pd
-import pandas_ta as ta
 import ccxt
 import time
 import warnings
@@ -28,6 +30,50 @@ from backtesting import Backtest, Strategy
 from backtesting.lib import crossover
 
 warnings.filterwarnings('ignore', category=FutureWarning)
+
+# =====================================================================
+# ИНДИКАТОРЫ — чистый pandas/numpy (pandas 3.x совместимо, без pandas_ta)
+# =====================================================================
+def _ema(series: pd.Series, n: int) -> pd.Series:
+    return series.ewm(span=n, adjust=False).mean()
+
+def _sma(series: pd.Series, n: int) -> pd.Series:
+    return series.rolling(n).mean()
+
+def _atr(h: pd.Series, l: pd.Series, c: pd.Series, n: int = 14) -> pd.Series:
+    prev_c = c.shift(1)
+    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/n, adjust=False).mean()
+
+def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def _macd(series: pd.Series, fast=12, slow=26, signal=9):
+    """Возвращает (macd_line, signal_line) как pd.Series."""
+    ml = _ema(series, fast) - _ema(series, slow)
+    sl = _ema(ml, signal)
+    return ml, sl
+
+def _bbands(series: pd.Series, n: int = 20, std: float = 2.0):
+    """Возвращает (lower, mid, upper) как pd.Series."""
+    mid   = _sma(series, n)
+    sigma = series.rolling(n).std()
+    return mid - std * sigma, mid, mid + std * sigma
+
+def _adx(h: pd.Series, l: pd.Series, c: pd.Series, n: int = 14) -> pd.Series:
+    atr14    = _atr(h, l, c, n)
+    up       = h.diff()
+    down     = -l.diff()
+    dm_plus  = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=h.index)
+    dm_minus = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=h.index)
+    dip  = dm_plus.ewm(alpha=1/n, adjust=False).mean()  / atr14 * 100
+    dim  = dm_minus.ewm(alpha=1/n, adjust=False).mean() / atr14 * 100
+    dx   = ((dip - dim).abs() / (dip + dim).replace(0, np.nan) * 100).fillna(0)
+    return dx.ewm(alpha=1/n, adjust=False).mean()
 
 # =====================================================================
 # КОНФИГУРАЦИЯ
@@ -44,6 +90,14 @@ REWARD_RATIO      = 2.5       # TP = SL × 2.5  (для EMA Cross)
 ATR_MULT_SL       = 2.0       # SL = ATR × 2.0 (для EMA Cross)
 MONITOR_INTERVAL  = 60        # Проверка сделок каждые 60 сек
 RADAR_INTERVAL    = 7200      # Радар каждые 2 часа
+
+# Лимиты открытых сделок
+MAX_EMA_TRADES    = 5         # Макс. одновременных EMA сделок
+MAX_MACD_TRADES   = 5         # Макс. одновременных MACD сделок
+
+# MACD параметры SL/TP (ATR-based, RR = 1:2.5)
+MACD_ATR_SL       = 1.5       # SL = ATR × 1.5
+MACD_ATR_TP       = 3.75      # TP = ATR × 3.75
 
 # Сетка запусков сканеров
 EMA_GRID_MINUTES  = 15        # EMA Cross: каждые 15 мин по сетке
@@ -231,20 +285,65 @@ def main_keyboard():
     return m
 
 # =====================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ БЭКТЕСТА (чистый numpy, без NaN)
+# =====================================================================
+def _bt_ema(arr: np.ndarray, n: int) -> np.ndarray:
+    """EMA без NaN — первые значения заполняются SMA."""
+    result = np.empty(len(arr))
+    result[0] = arr[0]
+    k = 2.0 / (n + 1)
+    for i in range(1, len(arr)):
+        result[i] = arr[i] * k + result[i - 1] * (1 - k)
+    return result
+
+def _bt_sma(arr: np.ndarray, n: int) -> np.ndarray:
+    """SMA без NaN — первые значения равны первому доступному SMA."""
+    result = np.empty(len(arr))
+    cumsum = np.cumsum(arr)
+    for i in range(len(arr)):
+        if i < n:
+            result[i] = cumsum[i] / (i + 1)
+        else:
+            result[i] = (cumsum[i] - cumsum[i - n]) / n
+    return result
+
+def _bt_rsi(arr: np.ndarray, n: int = 14) -> np.ndarray:
+    """RSI без NaN."""
+    result = np.full(len(arr), 50.0)
+    delta = np.diff(arr, prepend=arr[0])
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    avg_gain = _bt_sma(gain, n)
+    avg_loss = _bt_sma(loss, n)
+    for i in range(len(arr)):
+        if avg_loss[i] == 0:
+            result[i] = 100.0
+        else:
+            rs = avg_gain[i] / avg_loss[i]
+            result[i] = 100.0 - 100.0 / (1.0 + rs)
+    return result
+
+def _bt_atr(h: np.ndarray, l: np.ndarray, c: np.ndarray, n: int = 14) -> np.ndarray:
+    """ATR без NaN."""
+    tr = np.empty(len(h))
+    tr[0] = h[0] - l[0]
+    for i in range(1, len(h)):
+        tr[i] = max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
+    return _bt_sma(tr, n)
+
+# =====================================================================
 # СТРАТЕГИЯ 1: EMA Cross
 # =====================================================================
 class FortressBT(Strategy):
     def init(self):
-        c = pd.Series(self.data.Close)
-        h = pd.Series(self.data.High)
-        l = pd.Series(self.data.Low)
-        v = pd.Series(self.data.Volume)
-        self.ema12  = self.I(ta.ema, c, 12)
-        self.ema26  = self.I(ta.ema, c, 26)
-        self.atr    = self.I(ta.atr, h, l, c, 14)
-        self.vol_ma = self.I(ta.sma, v, 20)
+        self.ema12  = self.I(_bt_ema, self.data.Close, 12,  name='EMA12')
+        self.ema26  = self.I(_bt_ema, self.data.Close, 26,  name='EMA26')
+        self.atr    = self.I(_bt_atr, self.data.High, self.data.Low, self.data.Close, 14, name='ATR')
+        self.vol_ma = self.I(_bt_sma, self.data.Volume, 20, name='VolMA')
 
     def next(self):
+        if len(self.data.Close) < 30:
+            return
         price = self.data.Close[-1]
         v     = self.data.Volume
         trend_ok      = self.ema12[-1] > self.ema26[-1]
@@ -254,6 +353,8 @@ class FortressBT(Strategy):
         signals       = sum([vol_growing, price_growing, vol_spike])
         if trend_ok and signals >= 2 and not self.position:
             sl  = price - self.atr[-1] * ATR_MULT_SL
+            if sl <= 0 or sl >= price:
+                return
             tp2 = price + (price - sl) * 6.0
             self.buy(sl=sl, tp=tp2)
         elif self.position and self.trades:
@@ -272,19 +373,18 @@ class FortressBT(Strategy):
 # =====================================================================
 class BreakoutBT(Strategy):
     def init(self):
-        h = pd.Series(self.data.High)
-        l = pd.Series(self.data.Low)
-        c = pd.Series(self.data.Close)
-        v = pd.Series(self.data.Volume)
-        self.atr     = self.I(ta.atr, h, l, c, 14)
-        self.rsi     = self.I(ta.rsi, c, 14)
-        self.ema50   = self.I(ta.ema, c, 50)
-        self.vol_ma  = self.I(ta.sma, v, 20)
+        self.atr     = self.I(_bt_atr, self.data.High, self.data.Low, self.data.Close, 14, name='ATR')
+        self.rsi     = self.I(_bt_rsi, self.data.Close, 14, name='RSI')
+        self.ema50   = self.I(_bt_ema, self.data.Close, 50, name='EMA50')
+        self.vol_ma  = self.I(_bt_sma, self.data.Volume, 20, name='VolMA')
         self.highest = self.I(
-            lambda x: pd.Series(x).shift(1).rolling(20).max().values, c
+            lambda x: pd.Series(x).shift(1).rolling(20).max().bfill().ffill().values,
+            self.data.Close, name='Highest'
         )
 
     def next(self):
+        if len(self.data.Close) < 55:
+            return
         price     = self.data.Close[-1]
         trend_ok  = price > self.ema50[-1]
         breakout  = price > self.highest[-1]
@@ -292,6 +392,8 @@ class BreakoutBT(Strategy):
         volume_ok = self.data.Volume[-1] > self.vol_ma[-1] * 1.3
         if trend_ok and breakout and rsi_ok and volume_ok and not self.position:
             sl = price - self.atr[-1] * 1.5
+            if sl <= 0 or sl >= price:
+                return
             tp = price + abs(price - sl) * 3.5
             self.buy(sl=sl, tp=tp)
 
@@ -300,17 +402,14 @@ class BreakoutBT(Strategy):
 # =====================================================================
 class SqueezeBT(Strategy):
     def init(self):
-        h = pd.Series(self.data.High)
-        l = pd.Series(self.data.Low)
+        self.atr    = self.I(_bt_atr, self.data.High, self.data.Low, self.data.Close, 14, name='ATR')
+        self.rsi    = self.I(_bt_rsi, self.data.Close, 14, name='RSI')
+        self.vol_ma = self.I(_bt_sma, self.data.Volume, 20, name='VolMA')
         c = pd.Series(self.data.Close)
-        v = pd.Series(self.data.Volume)
-        self.atr    = self.I(ta.atr, h, l, c, 14)
-        self.rsi    = self.I(ta.rsi, c, 14)
-        self.vol_ma = self.I(ta.sma, v, 20)
-        bb = ta.bbands(c, length=20, std=2.0)
-        self._bb_lower = bb.iloc[:, 0].values
-        self._bb_mid   = bb.iloc[:, 1].values
-        self._bb_upper = bb.iloc[:, 2].values
+        bb_lower, bb_mid, bb_upper = _bbands(c, n=20, std=2.0)
+        self._bb_lower = bb_lower.bfill().ffill().values
+        self._bb_mid   = bb_mid.bfill().ffill().values
+        self._bb_upper = bb_upper.bfill().ffill().values
 
     def next(self):
         i = len(self.data.Close) - 1
@@ -329,6 +428,8 @@ class SqueezeBT(Strategy):
         rsi_ok    = 55 < self.rsi[-1] < 80
         if squeeze and breakout and volume_ok and rsi_ok and not self.position:
             sl = price - self.atr[-1] * 2.0
+            if sl <= 0 or sl >= price:
+                return
             tp = price + abs(price - sl) * 4.0
             self.buy(sl=sl, tp=tp)
 
@@ -398,20 +499,12 @@ class MACDReversalBT(Strategy):
     macd_signal = 9
 
     def init(self):
-        close   = pd.Series(self.data.Close)
-        macd_df = ta.macd(close,
-                          fast=self.macd_fast,
-                          slow=self.macd_slow,
-                          signal=self.macd_signal)
-        if macd_df is None or macd_df.shape[1] < 2:
-            zeros       = pd.Series([0.0] * len(close)).values
-            self.ml     = self.I(lambda: zeros)
-            self.sl_ind = self.I(lambda: zeros)
-        else:
-            ml_vals     = macd_df.iloc[:, 0].values.copy()
-            sl_vals     = macd_df.iloc[:, 1].values.copy()
-            self.ml     = self.I(lambda: ml_vals, name='MACD')
-            self.sl_ind = self.I(lambda: sl_vals, name='Signal')
+        close      = pd.Series(self.data.Close)
+        ml_s, sl_s = _macd(close, self.macd_fast, self.macd_slow, self.macd_signal)
+        ml_vals    = ml_s.fillna(0).values.copy()
+        sl_vals    = sl_s.fillna(0).values.copy()
+        self.ml     = self.I(lambda: ml_vals.copy(), name='MACD')
+        self.sl_ind = self.I(lambda: sl_vals.copy(), name='Signal')
 
     def next(self):
         if len(self.data.Close) < self.macd_slow + self.macd_signal + 5:
@@ -448,22 +541,28 @@ def analyze_symbol(symbol: str):
         exchange.fetch_ohlcv(symbol, '4h', limit=200),
         columns=['ts', 'o', 'h', 'l', 'c', 'v']
     )
-    ema50_s = ta.ema(df4h['c'], 50)
-    if ema50_s is None:
-        return None
-    ema50_4h = ema50_s.iloc[-2]
+    ema50_4h = _ema(df4h['c'], 50).iloc[-2]
     if pd.isna(ema50_4h) or df4h['c'].iloc[-2] < ema50_4h:
         return None
 
     # ADX фильтр — торгуем только в тренде (ADX > 25)
-    adx_df = ta.adx(df4h['h'], df4h['l'], df4h['c'], length=14)
-    if adx_df is not None and not adx_df.empty:
-        adx_col = [c for c in adx_df.columns if c.startswith('ADX_')]
-        if adx_col:
-            adx_val = adx_df[adx_col[0]].iloc[-2]
-            if not pd.isna(adx_val) and adx_val < 25:
-                print(f'[EMA] {symbol}: отсев — ADX {adx_val:.1f} < 25 (боковик)')
-                return None
+    # Ручная реализация ADX (совместима с pandas >= 2.0)
+    try:
+        h4 = df4h['h']; l4 = df4h['l']; c4 = df4h['c']
+        tr  = pd.concat([h4 - l4, (h4 - c4.shift()).abs(), (l4 - c4.shift()).abs()], axis=1).max(axis=1)
+        dm_plus  = ((h4 - h4.shift()) > (l4.shift() - l4)).astype(float) * (h4 - h4.shift()).clip(lower=0)
+        dm_minus = ((l4.shift() - l4) > (h4 - h4.shift())).astype(float) * (l4.shift() - l4).clip(lower=0)
+        n = 14
+        atr14   = tr.ewm(alpha=1/n, min_periods=n, adjust=False).mean()
+        dip     = dm_plus.ewm(alpha=1/n,  min_periods=n, adjust=False).mean() / atr14 * 100
+        dim     = dm_minus.ewm(alpha=1/n, min_periods=n, adjust=False).mean() / atr14 * 100
+        dx      = ((dip - dim).abs() / (dip + dim).replace(0, np.nan) * 100).fillna(0)
+        adx_val = dx.ewm(alpha=1/n, min_periods=n, adjust=False).mean().iloc[-2]
+        if not pd.isna(adx_val) and adx_val < 25:
+            print(f'[EMA] {symbol}: отсев — ADX {adx_val:.1f} < 25 (боковик)')
+            return None
+    except Exception:
+        pass  # Если ADX не считается — пропускаем фильтр
 
     # ── 1H: индикаторы ───────────────────────────────────────────────
     df = pd.DataFrame(
@@ -472,17 +571,17 @@ def analyze_symbol(symbol: str):
     )
     c = df['c']; h = df['h']; l = df['l']; v = df['v']
 
-    atr_s = ta.atr(h, l, c, 14)
-    ema12 = ta.ema(c, 12)
-    ema26 = ta.ema(c, 26)
+    atr_s = _atr(h, l, c, 14)
+    ema12 = _ema(c, 12)
+    ema26 = _ema(c, 26)
 
-    atr_val = atr_s.iloc[-2] if atr_s is not None else None
-    e12_val = ema12.iloc[-2] if ema12 is not None else None
-    e26_val = ema26.iloc[-2] if ema26 is not None else None
+    atr_val = atr_s.iloc[-2]
+    e12_val = ema12.iloc[-2]
+    e26_val = ema26.iloc[-2]
 
-    if atr_val is None or pd.isna(atr_val) or atr_val <= 0: return None
-    if e12_val is None or pd.isna(e12_val):                  return None
-    if e26_val is None or pd.isna(e26_val):                  return None
+    if pd.isna(atr_val) or atr_val <= 0: return None
+    if pd.isna(e12_val):                  return None
+    if pd.isna(e26_val):                  return None
     if (atr_val / c.iloc[-2]) * 100 < MIN_NATR:              return None
     if e12_val <= e26_val:                                    return None
 
@@ -535,21 +634,13 @@ def analyze_symbol_macd(symbol: str):
     )
     c = df['c']; h = df['h']; l = df['l']
 
-    atr_s = ta.atr(h, l, c, 14)
-    if atr_s is None:
-        return None
-    atr_val = atr_s.iloc[-2]
+    atr_val = _atr(h, l, c, 14).iloc[-2]
     if pd.isna(atr_val) or atr_val <= 0:
         return None
     if (atr_val / c.iloc[-2]) * 100 < MIN_NATR:
         return None
 
-    macd_df = ta.macd(c, fast=12, slow=26, signal=9)
-    if macd_df is None or macd_df.shape[1] < 2:
-        return None
-
-    ml = macd_df.iloc[:, 0]
-    sl = macd_df.iloc[:, 1]
+    ml, sl = _macd(c, fast=12, slow=26, signal=9)
 
     if any(pd.isna(ml.iloc[i]) or pd.isna(sl.iloc[i]) for i in [-2, -3]):
         return None
@@ -558,9 +649,9 @@ def analyze_symbol_macd(symbol: str):
     bear_cross = ml.iloc[-3] > sl.iloc[-3] and ml.iloc[-2] < sl.iloc[-2]
 
     if bull_cross:
-        return {'symbol': symbol, 'price': c.iloc[-2], 'side': 'long'}
+        return {'symbol': symbol, 'price': c.iloc[-2], 'side': 'long', 'atr': atr_val}
     if bear_cross:
-        return {'symbol': symbol, 'price': c.iloc[-2], 'side': 'short'}
+        return {'symbol': symbol, 'price': c.iloc[-2], 'side': 'short', 'atr': atr_val}
     return None
 
 # =====================================================================
@@ -595,7 +686,7 @@ def _analyze_radar_symbol(symbol: str):
         columns=['ts', 'o', 'h', 'l', 'c', 'v']
     )
     c = df['c']; v = df['v']; h = df['h']; l = df['l']
-    atr  = ta.atr(h, l, c, 14).iloc[-1]
+    atr  = _atr(h, l, c, 14).iloc[-1]
     natr = (atr / c.iloc[-1]) * 100
     if natr < 1.5:
         return None
@@ -649,6 +740,14 @@ def open_trade_ema(symbol: str, price: float, atr_val: float) -> bool:
     except (ccxt.NetworkError, ccxt.ExchangeError):
         pass
 
+    # Лимит открытых EMA сделок
+    ema_count = _read_db(
+        'SELECT COUNT(*) FROM active_trades WHERE macd_active=0',
+        fetchone=True)[0]
+    if ema_count >= MAX_EMA_TRADES:
+        print(f'[EMA] Лимит {MAX_EMA_TRADES} сделок достигнут — пропуск {symbol}')
+        return False
+
     balance = _read_db('SELECT balance FROM wallet', fetchone=True)[0]
     trades  = _read_db('SELECT symbol,side,entry_price,size FROM active_trades')
     unrealized = 0.0
@@ -691,9 +790,17 @@ def open_trade_ema(symbol: str, price: float, atr_val: float) -> bool:
 # =====================================================================
 # ОТКРЫТИЕ СДЕЛКИ — MACD
 # =====================================================================
-def open_trade_macd(symbol: str, price: float, side: str) -> bool:
+def open_trade_macd(symbol: str, price: float, side: str, atr_val: float) -> bool:
     if _read_db('SELECT 1 FROM active_trades WHERE symbol=?',
                 (symbol,), fetchone=True):
+        return False
+
+    # Лимит открытых MACD сделок
+    macd_count = _read_db(
+        'SELECT COUNT(*) FROM active_trades WHERE macd_active=1',
+        fetchone=True)[0]
+    if macd_count >= MAX_MACD_TRADES:
+        print(f'[MACD] Лимит {MAX_MACD_TRADES} сделок достигнут — пропуск {symbol}')
         return False
 
     balance = _read_db('SELECT balance FROM wallet', fetchone=True)[0]
@@ -706,8 +813,19 @@ def open_trade_macd(symbol: str, price: float, side: str) -> bool:
         except Exception:
             pass
     equity = balance + unrealized
-    # Риск 1% от equity / аварийный стоп 15%
-    size = (equity * RISK_PER_TRADE) / (price * 0.15)
+
+    # SL и TP на основе ATR (RR = 1:2.5)
+    sl_dist = atr_val * MACD_ATR_SL
+    tp_dist = atr_val * MACD_ATR_TP
+    if side == 'long':
+        sl = price - sl_dist
+        tp = price + tp_dist
+    else:
+        sl = price + sl_dist
+        tp = price - tp_dist
+
+    # Размер позиции: риск 1% от equity / дистанция SL
+    size = (equity * RISK_PER_TRADE) / sl_dist
 
     try:
         _write_db_sync(
@@ -715,8 +833,8 @@ def open_trade_macd(symbol: str, price: float, side: str) -> bool:
             '(symbol,side,entry_price,size,sl,tp,'
             ' is_trailing,trailing_sl,partial_price,'
             ' entry_time,entry_balance,scanner,macd_active) '
-            'VALUES (?,?,?,?,NULL,NULL,0,NULL,NULL,?,?,?,1)',
-            (symbol, side, price, size,
+            'VALUES (?,?,?,?,?,?,0,NULL,NULL,?,?,?,1)',
+            (symbol, side, price, size, sl, tp,
              datetime.now().strftime('%Y-%m-%d %H:%M:%S'), balance, 'macd')
         )
     except Exception as e:
@@ -727,7 +845,8 @@ def open_trade_macd(symbol: str, price: float, side: str) -> bool:
     bot.send_message(USER_ID,
         f'{icon} *MACD ВХОД: {symbol}*\n'
         f'Тип: *{side.upper()}* | Цена: `{price:.6g}`\n'
-        f'Выход: по обратному MACD сигналу',
+        f'🔴 SL: `{sl:.6g}` | 🎯 TP: `{tp:.6g}`\n'
+        f'📏 R:R: `1 : 2.5` | Риск: `{equity * RISK_PER_TRADE:.2f}` USDT',
         parse_mode='Markdown'
     )
     return True
@@ -789,15 +908,27 @@ async def monitor_trades():
                  entry_time, entry_balance, scanner, macd_active) = trade
 
                 if macd_active:
-                    # Аварийный стоп для MACD если убыток > 15% от цены входа
+                    # MACD сделки — мониторим SL и TP как обычные сделки
                     try:
-                        cur_price = exchange.fetch_ticker(symbol)['last']
+                        cur_price   = exchange.fetch_ticker(symbol)['last']
+                        candles_1m  = exchange.fetch_ohlcv(symbol, '1m', limit=2)
+                        c_low       = candles_1m[-2][3]
+                        c_high      = candles_1m[-2][2]
+
                         if side == 'long':
-                            loss_pct = (entry_price - cur_price) / entry_price * 100
-                        else:
-                            loss_pct = (cur_price - entry_price) / entry_price * 100
-                        if loss_pct > 15:
-                            close_trade(trade, cur_price, f'🚨 АВАРИЙНЫЙ СТОП -{loss_pct:.1f}%')
+                            sl_hit = cur_price <= sl or c_low  <= sl
+                            tp_hit = cur_price >= tp or c_high >= tp
+                            if sl_hit:
+                                close_trade(trade, min(cur_price, c_low), '🔴 STOP-LOSS')
+                            elif tp_hit:
+                                close_trade(trade, max(cur_price, c_high), '🎯 TAKE-PROFIT')
+                        else:  # short
+                            sl_hit = cur_price >= sl or c_high >= sl
+                            tp_hit = cur_price <= tp or c_low  <= tp
+                            if sl_hit:
+                                close_trade(trade, max(cur_price, c_high), '🔴 STOP-LOSS')
+                            elif tp_hit:
+                                close_trade(trade, min(cur_price, c_low), '🎯 TAKE-PROFIT')
                     except (ccxt.NetworkError, ccxt.ExchangeError):
                         pass
                     continue
@@ -813,8 +944,7 @@ async def monitor_trades():
                         exchange.fetch_ohlcv(symbol, '15m', limit=20),
                         columns=['ts', 'o', 'h', 'l', 'c', 'v']
                     )
-                    atr = ta.atr(df_15m['h'], df_15m['l'],
-                                 df_15m['c'], 14).iloc[-1]
+                    atr = _atr(df_15m['h'], df_15m['l'], df_15m['c'], 14).iloc[-1]
 
                     sl_hit  = price <= sl or candle_low  <= sl
                     tp1     = entry_price + (entry_price - sl) * 2.5
@@ -969,7 +1099,7 @@ async def macd_hunter():
                     if setup and setup['side'] != side:
                         close_trade(trade, setup['price'], '🔄 MACD разворот')
                         closed += 1
-                        open_trade_macd(sym, setup['price'], setup['side'])
+                        open_trade_macd(sym, setup['price'], setup['side'], setup['atr'])
                 except (ccxt.NetworkError, ccxt.ExchangeError) as e:
                     print(f'[MACD Monitor] Сеть {sym}: {e}')
                 except Exception as e:
@@ -982,7 +1112,7 @@ async def macd_hunter():
                 try:
                     setup = analyze_symbol_macd(sym)
                     if setup:
-                        if open_trade_macd(sym, setup['price'], setup['side']):
+                        if open_trade_macd(sym, setup['price'], setup['side'], setup['atr']):
                             if setup['side'] == 'long':
                                 found_long += 1
                             else:
@@ -1026,8 +1156,7 @@ def _score_symbol(symbol: str) -> dict | None:
             exchange.fetch_ohlcv(symbol, '4h', limit=200),
             columns=['ts', 'o', 'h', 'l', 'c', 'v']
         )
-        ema50_s  = ta.ema(df4h['c'], 50)
-        ema50_4h = ema50_s.iloc[-2] if ema50_s is not None else None
+        ema50_4h = _ema(df4h['c'], 50).iloc[-2]
 
         df = pd.DataFrame(
             exchange.fetch_ohlcv(symbol, '1h', limit=60),
@@ -1035,24 +1164,20 @@ def _score_symbol(symbol: str) -> dict | None:
         )
         c = df['c']; h = df['h']; l = df['l']; v = df['v']
 
-        atr_s = ta.atr(h, l, c, 14)
-        ema12 = ta.ema(c, 12)
-        ema26 = ta.ema(c, 26)
-
-        atr_val = atr_s.iloc[-2] if atr_s is not None else None
-        e12_val = ema12.iloc[-2] if ema12 is not None else None
-        e26_val = ema26.iloc[-2] if ema26 is not None else None
+        atr_val = _atr(h, l, c, 14).iloc[-2]
+        e12_val = _ema(c, 12).iloc[-2]
+        e26_val = _ema(c, 26).iloc[-2]
         price   = c.iloc[-2]
 
         # NATR
-        natr = (atr_val / price * 100) if atr_val else 0
+        natr = (atr_val / price * 100) if (not pd.isna(atr_val) and atr_val) else 0
         if natr >= MIN_NATR:
             score += 2
         else:
             details.append('низкая волатильность')
 
         # 4H тренд
-        if ema50_4h and not pd.isna(ema50_4h):
+        if not pd.isna(ema50_4h):
             if price > ema50_4h:
                 score += 2
                 direction = 'long'
@@ -1060,7 +1185,7 @@ def _score_symbol(symbol: str) -> dict | None:
                 details.append('↓EMA50 4H')
 
         # EMA12 vs EMA26
-        if e12_val and e26_val:
+        if not pd.isna(e12_val) and not pd.isna(e26_val) and e26_val != 0:
             diff_pct = abs(e12_val - e26_val) / e26_val * 100
             if e12_val > e26_val:
                 score += 2
@@ -1068,7 +1193,6 @@ def _score_symbol(symbol: str) -> dict | None:
                 if diff_pct < 0.5:
                     details.append(f'EMA почти пересекаются ({diff_pct:.2f}%)')
             else:
-                # Близко к бычьему пересечению?
                 if diff_pct < 1.0:
                     score += 1
                     details.append(f'EMA близко к пересечению ({diff_pct:.2f}%)')
@@ -1081,7 +1205,7 @@ def _score_symbol(symbol: str) -> dict | None:
             score += 1
         if v.iloc[-2] > vol_ma.iloc[-2] * 1.5:
             score += 1
-        if v.iloc[-2] > vol_ma.iloc[-2] * 1.2:  # чуть ниже порог
+        if v.iloc[-2] > vol_ma.iloc[-2] * 1.2:
             score += 1
 
         # ── MACD 30м скор (макс 6) ────────────────────────────────────
@@ -1089,32 +1213,28 @@ def _score_symbol(symbol: str) -> dict | None:
             exchange.fetch_ohlcv(symbol, '30m', limit=60),
             columns=['ts', 'o', 'h', 'l', 'c', 'v']
         )
-        macd_df = ta.macd(df30['c'], fast=12, slow=26, signal=9)
+        ml, sl = _macd(df30['c'], fast=12, slow=26, signal=9)
 
-        if macd_df is not None and macd_df.shape[1] >= 2:
-            ml = macd_df.iloc[:, 0]
-            sl = macd_df.iloc[:, 1]
+        if not pd.isna(ml.iloc[-2]) and not pd.isna(sl.iloc[-2]):
+            macd_diff = ml.iloc[-2] - sl.iloc[-2]
+            macd_diff_prev = ml.iloc[-3] - sl.iloc[-3]
 
-            if not pd.isna(ml.iloc[-2]) and not pd.isna(sl.iloc[-2]):
-                macd_diff = ml.iloc[-2] - sl.iloc[-2]
-                macd_diff_prev = ml.iloc[-3] - sl.iloc[-3]
+            # Уже пересеклось
+            if ml.iloc[-2] > sl.iloc[-2]:
+                score += 3
+                direction = direction or 'long'
+                details.append('MACD ✅ бычье пересечение')
+            elif ml.iloc[-2] < sl.iloc[-2]:
+                score += 2
+                direction = direction or 'short'
 
-                # Уже пересеклось
-                if ml.iloc[-2] > sl.iloc[-2]:
-                    score += 3
-                    direction = direction or 'long'
-                    details.append('MACD ✅ бычье пересечение')
-                elif ml.iloc[-2] < sl.iloc[-2]:
-                    score += 2
-                    direction = direction or 'short'
-
-                # Сближаются?
-                if abs(macd_diff) < abs(macd_diff_prev) * 0.5:
-                    score += 2
-                    details.append('MACD сближается ⚡')
-                elif abs(macd_diff) < abs(macd_diff_prev) * 0.8:
-                    score += 1
-                    details.append('MACD почти пересечение')
+            # Сближаются?
+            if abs(macd_diff) < abs(macd_diff_prev) * 0.5:
+                score += 2
+                details.append('MACD сближается ⚡')
+            elif abs(macd_diff) < abs(macd_diff_prev) * 0.8:
+                score += 1
+                details.append('MACD почти пересечение')
 
         # Итог
         if score < 5:
@@ -1262,9 +1382,9 @@ def cmd_start(msg):
     if msg.from_user.id != USER_ID:
         return
     bot.send_message(USER_ID,
-        '🛡️ *Fortress V4.2*\n\n'
+        '🛡️ *Fortress V4.4*\n\n'
         '📊 EMA Cross: каждые 15 мин по сетке\n'
-        '📉 MACD 30м: каждые 30 мин по сетке\n'
+        '📉 MACD 1ч: каждые 30 мин по сетке\n'
         'Статистика общая + раздельная по сканерам',
         parse_mode='Markdown', reply_markup=main_keyboard()
     )
@@ -1299,22 +1419,25 @@ def cmd_trades(msg):
         return
     trades = _read_db(
         'SELECT symbol,side,entry_price,sl,tp,'
-        '       is_trailing,trailing_sl,entry_time,scanner,macd_active '
+        '       is_trailing,trailing_sl,entry_time,scanner,macd_active,size '
         'FROM active_trades'
     )
     if not trades:
         bot.send_message(USER_ID, '⚔️ Активных сделок нет.')
         return
     text = '⚔️ *АКТИВНЫЕ СДЕЛКИ:*\n\n'
-    for sym, side, ep, sl, tp, is_tr, tsl, et, scn, macd_a in trades:
-        t    = et[11:16] if et and len(et) >= 16 else '—'
+    for sym, side, ep, sl, tp, is_tr, tsl, et, scn, macd_a, sz in trades:
+        # Дата и время открытия
+        if et and len(et) >= 16:
+            dt_part = et[5:10]   # MM-DD
+            tm_part = et[11:16]  # HH:MM
+            t = f'{dt_part} {tm_part}'
+        else:
+            t = '—'
         icon = '📊' if scn == 'ema' else '📉'
 
-        # Текущий PnL — берём size прямо из БД
+        # Текущий PnL
         try:
-            row       = _read_db('SELECT size FROM active_trades WHERE symbol=?',
-                                 (sym,), fetchone=True)
-            sz        = row[0] if row else 0
             cur_price = exchange.fetch_ticker(sym)['last']
             cur_pnl   = (cur_price - ep) * sz if side == 'long' \
                         else (ep - cur_price) * sz
@@ -1324,7 +1447,11 @@ def cmd_trades(msg):
             pnl_str = ''
 
         if macd_a:
-            mode = '🔄 Выход по MACD сигналу'
+            if sl and tp:
+                mode = (f'🔴 SL: `{sl:.6g}` | 🎯 TP: `{tp:.6g}`\n  '
+                        f'📏 R:R: `1 : 2.5`')
+            else:
+                mode = '🔄 Выход по MACD сигналу'
         elif is_tr:
             mode = (f'📍 Трейлинг SL: `{tsl:.6g}`\n  '
                     f'🔴 SL: `{sl:.6g}`')
@@ -1612,23 +1739,17 @@ def _deep_analyze(symbol: str) -> str:
             )
             c = df['c']; h = df['h']; l = df['l']
 
-            ema12   = ta.ema(c, 12)
-            ema26   = ta.ema(c, 26)
-            ema50   = ta.ema(c, 50)
-            rsi     = ta.rsi(c, 14)
-            atr_s   = ta.atr(h, l, c, 14)
-            macd_df = ta.macd(c, 12, 26, 9)
+            e12   = _ema(c, 12).iloc[-2]
+            e26   = _ema(c, 26).iloc[-2]
+            e50   = _ema(c, 50).iloc[-2]
+            rsi_v = _rsi(c, 14).iloc[-2]
+            atr_v = _atr(h, l, c, 14).iloc[-2]
+            ml, sl_macd = _macd(c, 12, 26, 9)
 
-            e12   = ema12.iloc[-2]  if ema12  is not None else None
-            e26   = ema26.iloc[-2]  if ema26  is not None else None
-            e50   = ema50.iloc[-2]  if ema50  is not None else None
-            rsi_v = rsi.iloc[-2]    if rsi    is not None else None
-            atr_v = atr_s.iloc[-2]  if atr_s  is not None else None
+            trend    = '🟢 бычий' if (not pd.isna(e12) and not pd.isna(e26) and e12 > e26) else '🔴 медвежий'
+            vs_ema50 = ('↑EMA50' if price > e50 else '↓EMA50') if not pd.isna(e50) else ''
 
-            trend    = '🟢 бычий' if (e12 and e26 and e12 > e26) else '🔴 медвежий'
-            vs_ema50 = ('↑EMA50' if price > e50 else '↓EMA50') if e50 else ''
-
-            if rsi_v:
+            if not pd.isna(rsi_v):
                 if rsi_v > 70:   rsi_zone = '🔴 перекуплен'
                 elif rsi_v < 30: rsi_zone = '🟢 перепродан'
                 else:            rsi_zone = '🟡 нейтрал'
@@ -1636,20 +1757,17 @@ def _deep_analyze(symbol: str) -> str:
                 rsi_zone = ''
 
             macd_sig = ''
-            if macd_df is not None and macd_df.shape[1] >= 2:
-                ml = macd_df.iloc[:, 0]
-                sl = macd_df.iloc[:, 1]
-                if not pd.isna(ml.iloc[-2]) and not pd.isna(sl.iloc[-2]):
-                    if ml.iloc[-3] < sl.iloc[-3] and ml.iloc[-2] > sl.iloc[-2]:
-                        macd_sig = 'бычье пересечение ⚡'
-                    elif ml.iloc[-3] > sl.iloc[-3] and ml.iloc[-2] < sl.iloc[-2]:
-                        macd_sig = 'медвежье пересечение ⚡'
-                    elif ml.iloc[-2] > sl.iloc[-2]:
-                        macd_sig = 'выше сигнала'
-                    else:
-                        macd_sig = 'ниже сигнала'
+            if not pd.isna(ml.iloc[-2]) and not pd.isna(sl_macd.iloc[-2]):
+                if ml.iloc[-3] < sl_macd.iloc[-3] and ml.iloc[-2] > sl_macd.iloc[-2]:
+                    macd_sig = 'бычье пересечение ⚡'
+                elif ml.iloc[-3] > sl_macd.iloc[-3] and ml.iloc[-2] < sl_macd.iloc[-2]:
+                    macd_sig = 'медвежье пересечение ⚡'
+                elif ml.iloc[-2] > sl_macd.iloc[-2]:
+                    macd_sig = 'выше сигнала'
+                else:
+                    macd_sig = 'ниже сигнала'
 
-            natr = (atr_v / price * 100) if atr_v else 0
+            natr = (atr_v / price * 100) if (not pd.isna(atr_v) and atr_v) else 0
             results[tf] = {
                 'trend': trend, 'vs_ema50': vs_ema50,
                 'rsi': rsi_v, 'rsi_zone': rsi_zone,
@@ -1867,7 +1985,7 @@ async def main_async():
 if __name__ == '__main__':
     init_db()
 
-    print('🛡️  Fortress Paper Trading V4.2')
+    print('🛡️  Fortress Paper Trading V4.4')
     print(f'   Режим: {"РЕАЛЬНАЯ ТОРГОВЛЯ" if LIVE_TRADING else "Бумажная торговля"}')
     print(f'   EMA Grid:  каждые {EMA_GRID_MINUTES} мин')
     print(f'   MACD Grid: каждые {MACD_GRID_MINUTES} мин')
