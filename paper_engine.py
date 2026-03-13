@@ -1,14 +1,10 @@
 """
-Fortress Paper Trading Bot V4.4
+Fortress Paper Trading Bot V4.5
 =================================
-Изменения по сравнению с V4.3:
-  - MACD: добавлены SL и TP на основе ATR (SL=ATR×1.5, TP=ATR×3.75, RR=1:2.5)
-  - MACD: убран аварийный стоп 15% — теперь есть реальный SL
-  - MACD: лимит MAX_MACD_TRADES одновременных сделок
-  - EMA: лимит MAX_EMA_TRADES одновременных сделок
-  - Бэктест: исправлена ошибка индикаторов (numpy→pd.Series wrapper)
-  - pandas_ta полностью заменён на чистые реализации (совместимость pandas 3.x)
-  - cmd_trades: size берётся из основного SELECT, добавлена дата открытия
+Изменения по сравнению с V4.4:
+  - Фильтр корреляции с BTC (4H, 50 свечей, порог 0.8)
+    Монеты с корреляцией > 0.8 отсеиваются в обоих сканерах
+  - BTC данные загружаются один раз перед сканом (не на каждую монету)
 """
 
 import asyncio
@@ -99,6 +95,11 @@ MAX_MACD_TRADES   = 5         # Макс. одновременных MACD сде
 MACD_ATR_SL       = 1.5       # SL = ATR × 1.5
 MACD_ATR_TP       = 3.75      # TP = ATR × 3.75
 
+# Фильтр корреляции с BTC
+BTC_CORR_TIMEFRAME = '4h'     # таймфрейм для расчёта корреляции
+BTC_CORR_LIMIT     = 50       # количество свечей
+BTC_CORR_MAX       = 0.8      # порог: монеты выше отсеиваются
+
 # Сетка запусков сканеров
 EMA_GRID_MINUTES  = 15        # EMA Cross: каждые 15 мин по сетке
 MACD_GRID_MINUTES = 30        # MACD:      каждые 30 мин по сетке
@@ -145,6 +146,47 @@ def seconds_until_next_grid(interval_minutes: int) -> float:
     if wait_min < 0.1:
         wait_min += interval_minutes
     return max(wait_min * 60, 5.0)
+
+# =====================================================================
+# ФИЛЬТР КОРРЕЛЯЦИИ С BTC
+# =====================================================================
+def fetch_btc_closes() -> pd.Series | None:
+    """Загружает закрытия BTC/USDT на 4H для расчёта корреляции. Вызывается один раз перед сканом."""
+    try:
+        df = pd.DataFrame(
+            exchange.fetch_ohlcv('BTC/USDT:USDT', BTC_CORR_TIMEFRAME, limit=BTC_CORR_LIMIT + 5),
+            columns=['ts', 'o', 'h', 'l', 'c', 'v']
+        )
+        return df['c'].reset_index(drop=True).iloc[-BTC_CORR_LIMIT:]
+    except Exception as e:
+        print(f'[Corr] Не удалось загрузить BTC: {e}')
+        return None
+
+
+def is_correlated_with_btc(symbol: str, btc_closes: pd.Series) -> bool:
+    """
+    Возвращает True если монета слишком коррелирует с BTC (|corr| >= BTC_CORR_MAX).
+    Корреляция считается по доходностям (pct_change) — более точный метод.
+    При ошибке — возвращает False (не блокируем монету если нет данных).
+    """
+    try:
+        df = pd.DataFrame(
+            exchange.fetch_ohlcv(symbol, BTC_CORR_TIMEFRAME, limit=BTC_CORR_LIMIT + 5),
+            columns=['ts', 'o', 'h', 'l', 'c', 'v']
+        )
+        closes = df['c'].reset_index(drop=True).iloc[-BTC_CORR_LIMIT:]
+        if len(closes) < 10 or len(btc_closes) < 10:
+            return False
+        sym_ret = closes.pct_change().dropna()
+        btc_ret = btc_closes.pct_change().dropna()
+        n = min(len(sym_ret), len(btc_ret))
+        correlation = float(np.corrcoef(sym_ret.iloc[-n:].values, btc_ret.iloc[-n:].values)[0, 1])
+        if abs(correlation) >= BTC_CORR_MAX:
+            print(f'[Corr] {symbol}: отсев — корреляция BTC {correlation:.2f}')
+            return True
+        return False
+    except Exception:
+        return False
 
 # =====================================================================
 # ПОТОКОБЕЗОПАСНАЯ ОЧЕРЕДЬ ДЛЯ SQLite
@@ -524,11 +566,12 @@ class MACDReversalBT(Strategy):
 # АНАЛИЗ СИМВОЛА — EMA Cross
 # =====================================================================
 # =====================================================================
-def analyze_symbol(symbol: str):
+def analyze_symbol(symbol: str, btc_closes: pd.Series | None = None):
     """
     Фильтры:
       - Объём 24ч > 120M USDT
       - NATR > 1.0%
+      - Корреляция с BTC < 0.8 (монета живёт своей жизнью)
       - Цена выше EMA50 на 4H
       - ADX > 25 на 4H (есть тренд, не боковик)
       - EMA12 > EMA26 на 1H
@@ -536,6 +579,10 @@ def analyze_symbol(symbol: str):
       - Фильтр импульсного бара
       - Все решения на iloc[-2] (закрытая свеча)
     """
+    # ── Фильтр корреляции с BTC ───────────────────────────────────────
+    if btc_closes is not None and is_correlated_with_btc(symbol, btc_closes):
+        return None
+
     # ── 4H: тренд + ADX фильтр ────────────────────────────────────────
     df4h = pd.DataFrame(
         exchange.fetch_ohlcv(symbol, '4h', limit=200),
@@ -620,14 +667,19 @@ def analyze_symbol(symbol: str):
 # =====================================================================
 # АНАЛИЗ СИМВОЛА — MACD 30м
 # =====================================================================
-def analyze_symbol_macd(symbol: str):
+def analyze_symbol_macd(symbol: str, btc_closes: pd.Series | None = None):
     """
     Фильтры:
       - Объём 24ч > 120M USDT (проверяется до вызова)
       - NATR > 1.0%
+      - Корреляция с BTC < 0.8 (монета живёт своей жизнью)
       - MACD пересекает Signal на 1ч (последняя завершённая свеча)
-    Возвращает {'symbol', 'price', 'side'} или None
+    Возвращает {'symbol', 'price', 'side', 'atr'} или None
     """
+    # ── Фильтр корреляции с BTC ───────────────────────────────────────
+    if btc_closes is not None and is_correlated_with_btc(symbol, btc_closes):
+        return None
+
     df = pd.DataFrame(
         exchange.fetch_ohlcv(symbol, '1h', limit=100),
         columns=['ts', 'o', 'h', 'l', 'c', 'v']
@@ -1028,11 +1080,16 @@ async def signal_hunter():
                 and (d.get('quoteVolume') or 0) >= MIN_VOLUME_24H
             ]
 
+            # Загружаем BTC один раз для всего скана
+            btc_closes = fetch_btc_closes()
+            if btc_closes is None:
+                print('[EMA] BTC данные недоступны — фильтр корреляции отключён')
+
             found = 0
             for i, sym in enumerate(candidates, 1):
                 print(f'[EMA] [{i}/{len(candidates)}] {sym}     ', end='\r')
                 try:
-                    setup = analyze_symbol(sym)
+                    setup = analyze_symbol(sym, btc_closes)
                     if setup and open_trade_ema(
                             setup['symbol'], setup['price'], setup['atr']):
                         found += 1
@@ -1084,6 +1141,11 @@ async def macd_hunter():
                 and (d.get('quoteVolume') or 0) >= MIN_VOLUME_24H
             ]
 
+            # Загружаем BTC один раз для всего скана
+            btc_closes = fetch_btc_closes()
+            if btc_closes is None:
+                print('[MACD] BTC данные недоступны — фильтр корреляции отключён')
+
             # ── Шаг 1: проверяем выходы из открытых MACD сделок ──────
             macd_trades = _read_db(
                 'SELECT id,symbol,side,entry_price,size,sl,tp,'
@@ -1095,6 +1157,7 @@ async def macd_hunter():
             for trade in macd_trades:
                 sym = trade[1]; side = trade[2]
                 try:
+                    # При развороте корреляцию не проверяем — уже в позиции
                     setup = analyze_symbol_macd(sym)
                     if setup and setup['side'] != side:
                         close_trade(trade, setup['price'], '🔄 MACD разворот')
@@ -1110,7 +1173,7 @@ async def macd_hunter():
             for i, sym in enumerate(candidates, 1):
                 print(f'[MACD] [{i}/{len(candidates)}] {sym}     ', end='\r')
                 try:
-                    setup = analyze_symbol_macd(sym)
+                    setup = analyze_symbol_macd(sym, btc_closes)
                     if setup:
                         if open_trade_macd(sym, setup['price'], setup['side'], setup['atr']):
                             if setup['side'] == 'long':
@@ -1382,7 +1445,7 @@ def cmd_start(msg):
     if msg.from_user.id != USER_ID:
         return
     bot.send_message(USER_ID,
-        '🛡️ *Fortress V4.4*\n\n'
+        '🛡️ *Fortress V4.5*\n\n'
         '📊 EMA Cross: каждые 15 мин по сетке\n'
         '📉 MACD 1ч: каждые 30 мин по сетке\n'
         'Статистика общая + раздельная по сканерам',
@@ -1985,7 +2048,7 @@ async def main_async():
 if __name__ == '__main__':
     init_db()
 
-    print('🛡️  Fortress Paper Trading V4.4')
+    print('🛡️  Fortress Paper Trading V4.5')
     print(f'   Режим: {"РЕАЛЬНАЯ ТОРГОВЛЯ" if LIVE_TRADING else "Бумажная торговля"}')
     print(f'   EMA Grid:  каждые {EMA_GRID_MINUTES} мин')
     print(f'   MACD Grid: каждые {MACD_GRID_MINUTES} мин')
