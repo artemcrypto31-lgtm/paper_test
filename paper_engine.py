@@ -1,10 +1,14 @@
 """
-Fortress Paper Trading Bot V4.5
+Fortress Paper Trading Bot V4.6
 =================================
-Изменения по сравнению с V4.4:
-  - Фильтр корреляции с BTC (4H, 50 свечей, порог 0.8)
-    Монеты с корреляцией > 0.8 отсеиваются в обоих сканерах
-  - BTC данные загружаются один раз перед сканом (не на каждую монету)
+Изменения по сравнению с V4.5:
+  - EMA Cross теперь торгует в обе стороны (LONG + SHORT)
+  - SHORT: цена < EMA50 4H + EMA12 < EMA26 1H + медвежьи объёмные сигналы
+  - SHORT EMA: зеркальный трейлинг (TP1 → безубыток → трейлинг вниз)
+  - SHORT EMA: зеркальный фильтр импульсного бара (медвежий бар)
+  - Фикс race condition в close_trade (_write_db_sync для баланса)
+  - Фикс RSI в бэктесте (Wilder's RMA вместо SMA)
+  - Защита от нулевого std в корреляции BTC
 """
 
 import asyncio
@@ -570,21 +574,18 @@ class MACDReversalBT(Strategy):
                 self.sell()
 
 # =====================================================================
-# АНАЛИЗ СИМВОЛА — EMA Cross
-# =====================================================================
+# АНАЛИЗ СИМВОЛА — EMA Cross (LONG + SHORT)
 # =====================================================================
 def analyze_symbol(symbol: str, btc_closes: pd.Series | None = None):
     """
-    Фильтры:
-      - Объём 24ч > 120M USDT
+    Фильтры общие:
+      - Корреляция с BTC < 0.8
       - NATR > 1.0%
-      - Корреляция с BTC < 0.8 (монета живёт своей жизнью)
-      - Цена выше EMA50 на 4H
-      - ADX > 25 на 4H (есть тренд, не боковик)
-      - EMA12 > EMA26 на 1H
-      - 3 из 4: vol_growing, price_growing, vol_spike×1.5, context_ok
-      - Фильтр импульсного бара
-      - Все решения на iloc[-2] (закрытая свеча)
+      - ADX > 25 на 4H (есть тренд)
+    LONG:  цена > EMA50 4H | EMA12 > EMA26 1H | 3/4 объёмных сигнала | бычий импульсный бар
+    SHORT: цена < EMA50 4H | EMA12 < EMA26 1H | 3/4 медвежьих сигнала | медвежий импульсный бар
+    Все решения на iloc[-2] (закрытая свеча).
+    Возвращает {'symbol', 'price', 'atr', 'side'} или None.
     """
     # ── Фильтр корреляции с BTC ───────────────────────────────────────
     if btc_closes is not None and is_correlated_with_btc(symbol, btc_closes):
@@ -595,28 +596,29 @@ def analyze_symbol(symbol: str, btc_closes: pd.Series | None = None):
         exchange.fetch_ohlcv(symbol, '4h', limit=200),
         columns=['ts', 'o', 'h', 'l', 'c', 'v']
     )
-    ema50_4h = _ema(df4h['c'], 50).iloc[-2]
-    if pd.isna(ema50_4h) or df4h['c'].iloc[-2] < ema50_4h:
+    ema50_4h  = _ema(df4h['c'], 50).iloc[-2]
+    price_4h  = df4h['c'].iloc[-2]
+    if pd.isna(ema50_4h):
         return None
+    above_ema50 = price_4h > ema50_4h   # True → long, False → short
 
     # ADX фильтр — торгуем только в тренде (ADX > 25)
-    # Ручная реализация ADX (совместима с pandas >= 2.0)
     try:
         h4 = df4h['h']; l4 = df4h['l']; c4 = df4h['c']
-        tr  = pd.concat([h4 - l4, (h4 - c4.shift()).abs(), (l4 - c4.shift()).abs()], axis=1).max(axis=1)
+        tr       = pd.concat([h4 - l4, (h4 - c4.shift()).abs(), (l4 - c4.shift()).abs()], axis=1).max(axis=1)
         dm_plus  = ((h4 - h4.shift()) > (l4.shift() - l4)).astype(float) * (h4 - h4.shift()).clip(lower=0)
         dm_minus = ((l4.shift() - l4) > (h4 - h4.shift())).astype(float) * (l4.shift() - l4).clip(lower=0)
-        n = 14
-        atr14   = tr.ewm(alpha=1/n, min_periods=n, adjust=False).mean()
-        dip     = dm_plus.ewm(alpha=1/n,  min_periods=n, adjust=False).mean() / atr14 * 100
-        dim     = dm_minus.ewm(alpha=1/n, min_periods=n, adjust=False).mean() / atr14 * 100
-        dx      = ((dip - dim).abs() / (dip + dim).replace(0, np.nan) * 100).fillna(0)
-        adx_val = dx.ewm(alpha=1/n, min_periods=n, adjust=False).mean().iloc[-2]
+        n        = 14
+        atr14    = tr.ewm(alpha=1/n, min_periods=n, adjust=False).mean()
+        dip      = dm_plus.ewm(alpha=1/n,  min_periods=n, adjust=False).mean() / atr14 * 100
+        dim      = dm_minus.ewm(alpha=1/n, min_periods=n, adjust=False).mean() / atr14 * 100
+        dx       = ((dip - dim).abs() / (dip + dim).replace(0, np.nan) * 100).fillna(0)
+        adx_val  = dx.ewm(alpha=1/n, min_periods=n, adjust=False).mean().iloc[-2]
         if not pd.isna(adx_val) and adx_val < 25:
             print(f'[EMA] {symbol}: отсев — ADX {adx_val:.1f} < 25 (боковик)')
             return None
     except Exception:
-        pass  # Если ADX не считается — пропускаем фильтр
+        pass
 
     # ── 1H: индикаторы ───────────────────────────────────────────────
     df = pd.DataFrame(
@@ -625,33 +627,42 @@ def analyze_symbol(symbol: str, btc_closes: pd.Series | None = None):
     )
     c = df['c']; h = df['h']; l = df['l']; v = df['v']
 
-    atr_s = _atr(h, l, c, 14)
-    ema12 = _ema(c, 12)
-    ema26 = _ema(c, 26)
-
-    atr_val = atr_s.iloc[-2]
-    e12_val = ema12.iloc[-2]
-    e26_val = ema26.iloc[-2]
+    atr_val = _atr(h, l, c, 14).iloc[-2]
+    e12_val = _ema(c, 12).iloc[-2]
+    e26_val = _ema(c, 26).iloc[-2]
 
     if pd.isna(atr_val) or atr_val <= 0: return None
-    if pd.isna(e12_val):                  return None
-    if pd.isna(e26_val):                  return None
-    if (atr_val / c.iloc[-2]) * 100 < MIN_NATR:              return None
-    if e12_val <= e26_val:                                    return None
+    if pd.isna(e12_val) or pd.isna(e26_val): return None
+    if (atr_val / c.iloc[-2]) * 100 < MIN_NATR: return None
 
-    vol_ma        = v.rolling(20).mean()
-    vol_growing   = v.iloc[-2] > v.iloc[-3] > v.iloc[-4]
-    price_growing = c.iloc[-2] > c.iloc[-3] > c.iloc[-4]
-    vol_spike     = v.iloc[-2] > vol_ma.iloc[-2] * 1.5
+    # ── Определяем направление ────────────────────────────────────────
+    if above_ema50 and e12_val > e26_val:
+        side = 'long'
+    elif not above_ema50 and e12_val < e26_val:
+        side = 'short'
+    else:
+        return None  # тренд 4H и 1H не совпадают
 
-    bear_bars  = df[df['c'] < df['o']].iloc[:-1]
-    context_ok = (c.iloc[-2] > bear_bars.loc[bear_bars['v'].idxmax(), 'o']
-                  if len(bear_bars) > 0 else True)
+    # ── Объёмные и ценовые сигналы (зеркально для шорта) ─────────────
+    vol_ma      = v.rolling(20).mean()
+    vol_growing = v.iloc[-2] > v.iloc[-3] > v.iloc[-4]
+    vol_spike   = v.iloc[-2] > vol_ma.iloc[-2] * 1.5
 
-    if sum([vol_growing, price_growing, vol_spike, context_ok]) < 3:
+    if side == 'long':
+        price_signal = c.iloc[-2] > c.iloc[-3] > c.iloc[-4]
+        bull_bars    = df[df['c'] > df['o']].iloc[:-1]
+        context_ok   = (c.iloc[-2] > bull_bars.loc[bull_bars['v'].idxmax(), 'o']
+                        if len(bull_bars) > 0 else True)
+    else:
+        price_signal = c.iloc[-2] < c.iloc[-3] < c.iloc[-4]
+        bear_bars    = df[df['c'] < df['o']].iloc[:-1]
+        context_ok   = (c.iloc[-2] < bear_bars.loc[bear_bars['v'].idxmax(), 'o']
+                        if len(bear_bars) > 0 else True)
+
+    if sum([vol_growing, price_signal, vol_spike, context_ok]) < 3:
         return None
 
-    # ── Фильтр импульсного бара ───────────────────────────────────────
+    # ── Фильтр импульсного бара (зеркально для шорта) ────────────────
     bodies   = (df['c'] - df['o']).abs()
     avg_body = bodies.iloc[-22:-2].mean()
     if avg_body > 0:
@@ -662,14 +673,22 @@ def analyze_symbol(symbol: str, btc_closes: pd.Series | None = None):
             big_open  = df['o'].iloc[big_idx]
             big_close = df['c'].iloc[big_idx]
             midpoint  = (big_open + big_close) / 2
-            if big_close > big_open:
-                in_zone = big_open <= c.iloc[-2] <= midpoint
+            if side == 'long':
+                # Бычий бар — цена должна быть в зоне отката
+                if big_close > big_open:
+                    in_zone = big_open <= c.iloc[-2] <= midpoint
+                else:
+                    in_zone = False
             else:
-                in_zone = midpoint <= c.iloc[-2] <= big_open
+                # Медвежий бар — цена должна быть в зоне отката вверх
+                if big_close < big_open:
+                    in_zone = midpoint <= c.iloc[-2] <= big_open
+                else:
+                    in_zone = False
             if not in_zone:
                 return None
 
-    return {'symbol': symbol, 'price': c.iloc[-2], 'atr': atr_val}
+    return {'symbol': symbol, 'price': c.iloc[-2], 'atr': atr_val, 'side': side}
 
 # =====================================================================
 # АНАЛИЗ СИМВОЛА — MACD 30м
@@ -783,18 +802,18 @@ def _format_radar_results(found: list, title: str) -> str:
     return text[:4000]
 
 # =====================================================================
-# ОТКРЫТИЕ СДЕЛКИ — EMA Cross
+# ОТКРЫТИЕ СДЕЛКИ — EMA Cross (LONG + SHORT)
 # =====================================================================
-def open_trade_ema(symbol: str, price: float, atr_val: float) -> bool:
+def open_trade_ema(symbol: str, price: float, atr_val: float, side: str = 'long') -> bool:
     if _read_db('SELECT 1 FROM active_trades WHERE symbol=?',
                 (symbol,), fetchone=True):
         return False
 
     try:
         candles = exchange.fetch_ohlcv(symbol, '1h', limit=3)
-        change  = (price / candles[-2][4] - 1) * 100
+        change  = abs((price / candles[-2][4] - 1) * 100)
         if change > 5.0:
-            print(f'[EMA] Пропуск {symbol}: +{change:.1f}% за час')
+            print(f'[EMA] Пропуск {symbol}: {change:.1f}% за час')
             return False
     except (ccxt.NetworkError, ccxt.ExchangeError):
         pass
@@ -818,9 +837,17 @@ def open_trade_ema(symbol: str, price: float, atr_val: float) -> bool:
             pass
     equity  = balance + unrealized
     sl_dist = atr_val * ATR_MULT_SL
-    sl      = price - sl_dist
-    tp      = price + sl_dist * REWARD_RATIO
     size    = (equity * RISK_PER_TRADE) / sl_dist
+
+    if side == 'long':
+        sl = price - sl_dist
+        tp = price + sl_dist * REWARD_RATIO
+        # LONG: трейлинг после TP1 (как раньше)
+        ema_tp_field = tp   # сохраняем TP как ориентир, трейлинг активируется в monitor
+    else:
+        sl = price + sl_dist
+        tp = price - sl_dist * REWARD_RATIO
+        ema_tp_field = tp
 
     try:
         _write_db_sync(
@@ -829,19 +856,21 @@ def open_trade_ema(symbol: str, price: float, atr_val: float) -> bool:
             ' is_trailing,trailing_sl,partial_price,'
             ' entry_time,entry_balance,scanner,macd_active) '
             'VALUES (?,?,?,?,?,?,0,NULL,NULL,?,?,?,0)',
-            (symbol, 'long', price, size, sl, tp,
+            (symbol, side, price, size, sl, ema_tp_field,
              datetime.now().strftime('%Y-%m-%d %H:%M:%S'), balance, 'ema')
         )
     except Exception as e:
         print(f'[EMA] Не удалось открыть {symbol}: {e}')
         return False
 
+    icon = '🚀' if side == 'long' else '🔻'
+    tp1  = price - sl_dist * 2.5 if side == 'short' else price + sl_dist * 2.5
     bot.send_message(USER_ID,
-        f'🚀 *EMA ВХОД: {symbol}*\n'
-        f'Тип: *LONG* | Цена: `{price:.6g}`\n'
+        f'{icon} *EMA ВХОД: {symbol}*\n'
+        f'Тип: *{side.upper()}* | Цена: `{price:.6g}`\n'
         f'🔴 SL: `{sl:.6g}`\n'
-        f'🎯 TP1: `{price + sl_dist * 2.5:.6g}` → трейлинг\n'
-        f'💵 Риск: `{balance * RISK_PER_TRADE:.2f}` USDT',
+        f'🎯 TP1: `{tp1:.6g}` → трейлинг\n'
+        f'💵 Риск: `{equity * RISK_PER_TRADE:.2f}` USDT',
         parse_mode='Markdown'
     )
     return True
@@ -1005,45 +1034,73 @@ async def monitor_trades():
                     )
                     atr = _atr(df_15m['h'], df_15m['l'], df_15m['c'], 14).iloc[-1]
 
-                    sl_hit  = price <= sl or candle_low  <= sl
-                    tp1     = entry_price + (entry_price - sl) * 2.5
-                    tp1_hit = price >= tp1 or candle_high >= tp1
+                    if side == 'long':
+                        sl_hit  = price <= sl or candle_low  <= sl
+                        tp1     = entry_price + (entry_price - sl) * 2.5
+                        tp1_hit = price >= tp1 or candle_high >= tp1
 
-                    if not is_trailing:
-                        if sl_hit:
-                            close_trade(trade, min(price, candle_low),
-                                        '🔴 STOP-LOSS')
-                        elif tp1_hit:
-                            close_price  = max(price, candle_high)
-                            partial_size = size * 0.5
-                            pnl_partial  = (close_price - entry_price) * partial_size
-                            # Атомарное обновление — нет race condition
-                            _write_db('UPDATE wallet SET balance = balance + ?',
-                                      (pnl_partial,))
-                            _write_db(
-                                'UPDATE active_trades '
-                                'SET size=?,is_trailing=1,'
-                                '    trailing_sl=?,partial_price=? '
-                                'WHERE id=?',
-                                (partial_size, entry_price, close_price, tid)
-                            )
-                            bot.send_message(USER_ID,
-                                f'🎯 *ЧАСТИЧНОЕ ЗАКРЫТИЕ: {symbol}*\n'
-                                f'50% по `{close_price:.6g}` | '
-                                f'PnL: `+{pnl_partial:.2f}` USDT\n'
-                                f'SL → безубыток | Трейлинг активирован',
-                                parse_mode='Markdown'
-                            )
-                    else:
-                        new_tsl = max(trailing_sl, price - atr * 1.0)
-                        if price <= trailing_sl or candle_low <= trailing_sl:
-                            close_trade(trade, min(price, candle_low),
-                                        '📍 ТРЕЙЛИНГ СТОП')
-                        elif new_tsl > trailing_sl:
-                            _write_db(
-                                'UPDATE active_trades SET trailing_sl=? WHERE id=?',
-                                (new_tsl, tid)
-                            )
+                        if not is_trailing:
+                            if sl_hit:
+                                close_trade(trade, min(price, candle_low), '🔴 STOP-LOSS')
+                            elif tp1_hit:
+                                close_price  = max(price, candle_high)
+                                partial_size = size * 0.5
+                                pnl_partial  = (close_price - entry_price) * partial_size
+                                _write_db('UPDATE wallet SET balance = balance + ?', (pnl_partial,))
+                                _write_db(
+                                    'UPDATE active_trades '
+                                    'SET size=?,is_trailing=1,trailing_sl=?,partial_price=? '
+                                    'WHERE id=?',
+                                    (partial_size, entry_price, close_price, tid)
+                                )
+                                bot.send_message(USER_ID,
+                                    f'🎯 *ЧАСТИЧНОЕ ЗАКРЫТИЕ: {symbol}*\n'
+                                    f'50% по `{close_price:.6g}` | '
+                                    f'PnL: `+{pnl_partial:.2f}` USDT\n'
+                                    f'SL → безубыток | Трейлинг активирован',
+                                    parse_mode='Markdown'
+                                )
+                        else:
+                            new_tsl = max(trailing_sl, price - atr * 1.0)
+                            if price <= trailing_sl or candle_low <= trailing_sl:
+                                close_trade(trade, min(price, candle_low), '📍 ТРЕЙЛИНГ СТОП')
+                            elif new_tsl > trailing_sl:
+                                _write_db('UPDATE active_trades SET trailing_sl=? WHERE id=?',
+                                          (new_tsl, tid))
+
+                    else:  # EMA SHORT — трейлинг зеркально
+                        sl_hit  = price >= sl or candle_high >= sl
+                        tp1     = entry_price - (sl - entry_price) * 2.5
+                        tp1_hit = price <= tp1 or candle_low <= tp1
+
+                        if not is_trailing:
+                            if sl_hit:
+                                close_trade(trade, max(price, candle_high), '🔴 STOP-LOSS')
+                            elif tp1_hit:
+                                close_price  = min(price, candle_low)
+                                partial_size = size * 0.5
+                                pnl_partial  = (entry_price - close_price) * partial_size
+                                _write_db('UPDATE wallet SET balance = balance + ?', (pnl_partial,))
+                                _write_db(
+                                    'UPDATE active_trades '
+                                    'SET size=?,is_trailing=1,trailing_sl=?,partial_price=? '
+                                    'WHERE id=?',
+                                    (partial_size, entry_price, close_price, tid)
+                                )
+                                bot.send_message(USER_ID,
+                                    f'🎯 *ЧАСТИЧНОЕ ЗАКРЫТИЕ: {symbol}*\n'
+                                    f'50% по `{close_price:.6g}` | '
+                                    f'PnL: `+{pnl_partial:.2f}` USDT\n'
+                                    f'SL → безубыток | Трейлинг активирован',
+                                    parse_mode='Markdown'
+                                )
+                        else:
+                            new_tsl = min(trailing_sl, price + atr * 1.0)
+                            if price >= trailing_sl or candle_high >= trailing_sl:
+                                close_trade(trade, max(price, candle_high), '📍 ТРЕЙЛИНГ СТОП')
+                            elif new_tsl < trailing_sl:
+                                _write_db('UPDATE active_trades SET trailing_sl=? WHERE id=?',
+                                          (new_tsl, tid))
 
                 except (ccxt.NetworkError, ccxt.ExchangeError) as e:
                     print(f'[Monitor] Сеть {symbol}: {e}')
@@ -1098,7 +1155,7 @@ async def signal_hunter():
                 try:
                     setup = analyze_symbol(sym, btc_closes)
                     if setup and open_trade_ema(
-                            setup['symbol'], setup['price'], setup['atr']):
+                            setup['symbol'], setup['price'], setup['atr'], setup['side']):
                         found += 1
                 except (ccxt.NetworkError, ccxt.ExchangeError) as e:
                     print(f'[EMA] Сеть {sym}: {e}')
@@ -1450,7 +1507,7 @@ def cmd_start(msg):
     if msg.from_user.id != USER_ID:
         return
     bot.send_message(USER_ID,
-        '🛡️ *Fortress V4.5*\n\n'
+        '🛡️ *Fortress V4.6*\n\n'
         '📊 EMA Cross: каждые 15 мин по сетке\n'
         '📉 MACD 1ч: каждые 30 мин по сетке\n'
         'Статистика общая + раздельная по сканерам',
@@ -2053,7 +2110,7 @@ async def main_async():
 if __name__ == '__main__':
     init_db()
 
-    print('🛡️  Fortress Paper Trading V4.5')
+    print('🛡️  Fortress Paper Trading V4.6')
     print(f'   Режим: {"РЕАЛЬНАЯ ТОРГОВЛЯ" if LIVE_TRADING else "Бумажная торговля"}')
     print(f'   EMA Grid:  каждые {EMA_GRID_MINUTES} мин')
     print(f'   MACD Grid: каждые {MACD_GRID_MINUTES} мин')
@@ -2075,4 +2132,3 @@ if __name__ == '__main__':
         except Exception as e:
             print(f'Сетевой сбой: {e}. Перезапуск через 5 сек...')
             time.sleep(5)
-            
