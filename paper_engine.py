@@ -237,14 +237,24 @@ def _write_db_sync(sql: str, params: tuple = ()):
     return holder.get('lastrowid')
 
 
+_read_conn_local = threading.local()
+
 def _read_db(sql: str, params: tuple = (), fetchone: bool = False):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute('PRAGMA journal_mode=WAL')
+    """Читает из БД. Держит соединение per-thread для эффективности."""
+    if not hasattr(_read_conn_local, 'conn') or _read_conn_local.conn is None:
+        _read_conn_local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _read_conn_local.conn.execute('PRAGMA journal_mode=WAL')
     try:
-        cur = conn.execute(sql, params)
+        cur = _read_conn_local.conn.execute(sql, params)
         return cur.fetchone() if fetchone else cur.fetchall()
-    finally:
-        conn.close()
+    except Exception:
+        # При ошибке сбрасываем соединение — пересоздастся при следующем вызове
+        try:
+            _read_conn_local.conn.close()
+        except Exception:
+            pass
+        _read_conn_local.conn = None
+        raise
 
 # =====================================================================
 # ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ
@@ -604,16 +614,7 @@ def analyze_symbol(symbol: str, btc_closes: pd.Series | None = None):
 
     # ADX фильтр — торгуем только в тренде (ADX > 25)
     try:
-        h4 = df4h['h']; l4 = df4h['l']; c4 = df4h['c']
-        tr       = pd.concat([h4 - l4, (h4 - c4.shift()).abs(), (l4 - c4.shift()).abs()], axis=1).max(axis=1)
-        dm_plus  = ((h4 - h4.shift()) > (l4.shift() - l4)).astype(float) * (h4 - h4.shift()).clip(lower=0)
-        dm_minus = ((l4.shift() - l4) > (h4 - h4.shift())).astype(float) * (l4.shift() - l4).clip(lower=0)
-        n        = 14
-        atr14    = tr.ewm(alpha=1/n, min_periods=n, adjust=False).mean()
-        dip      = dm_plus.ewm(alpha=1/n,  min_periods=n, adjust=False).mean() / atr14 * 100
-        dim      = dm_minus.ewm(alpha=1/n, min_periods=n, adjust=False).mean() / atr14 * 100
-        dx       = ((dip - dim).abs() / (dip + dim).replace(0, np.nan) * 100).fillna(0)
-        adx_val  = dx.ewm(alpha=1/n, min_periods=n, adjust=False).mean().iloc[-2]
+        adx_val = _adx(df4h['h'], df4h['l'], df4h['c'], 14).iloc[-2]
         if not pd.isna(adx_val) and adx_val < 25:
             print(f'[EMA] {symbol}: отсев — ADX {adx_val:.1f} < 25 (боковик)')
             return None
@@ -837,17 +838,20 @@ def open_trade_ema(symbol: str, price: float, atr_val: float, side: str = 'long'
             pass
     equity  = balance + unrealized
     sl_dist = atr_val * ATR_MULT_SL
-    size    = (equity * RISK_PER_TRADE) / sl_dist
+    # Защита от аномально маленького ATR — минимум 0.1% от цены
+    min_sl_dist = price * 0.001
+    if sl_dist < min_sl_dist:
+        print(f'[EMA] Пропуск {symbol}: sl_dist слишком мал ({sl_dist:.8f})')
+        return False
+    size = (equity * RISK_PER_TRADE) / sl_dist
 
     if side == 'long':
         sl = price - sl_dist
-        tp = price + sl_dist * REWARD_RATIO
-        # LONG: трейлинг после TP1 (как раньше)
-        ema_tp_field = tp   # сохраняем TP как ориентир, трейлинг активируется в monitor
     else:
         sl = price + sl_dist
-        tp = price - sl_dist * REWARD_RATIO
-        ema_tp_field = tp
+
+    # TP для EMA не хранится — считается динамически в monitor (TP1 = SL_dist × 2.5)
+    # Поле tp в БД оставляем NULL для EMA сделок
 
     try:
         _write_db_sync(
@@ -855,8 +859,8 @@ def open_trade_ema(symbol: str, price: float, atr_val: float, side: str = 'long'
             '(symbol,side,entry_price,size,sl,tp,'
             ' is_trailing,trailing_sl,partial_price,'
             ' entry_time,entry_balance,scanner,macd_active) '
-            'VALUES (?,?,?,?,?,?,0,NULL,NULL,?,?,?,0)',
-            (symbol, side, price, size, sl, ema_tp_field,
+            'VALUES (?,?,?,?,?,NULL,0,NULL,NULL,?,?,?,0)',
+            (symbol, side, price, size, sl,
              datetime.now().strftime('%Y-%m-%d %H:%M:%S'), balance, 'ema')
         )
     except Exception as e:
@@ -905,6 +909,11 @@ def open_trade_macd(symbol: str, price: float, side: str, atr_val: float) -> boo
     # SL и TP на основе ATR (RR = 1:2.5)
     sl_dist = atr_val * MACD_ATR_SL
     tp_dist = atr_val * MACD_ATR_TP
+    # Защита от аномально маленького ATR
+    min_sl_dist = price * 0.001
+    if sl_dist < min_sl_dist:
+        print(f'[MACD] Пропуск {symbol}: sl_dist слишком мал ({sl_dist:.8f})')
+        return False
     if side == 'long':
         sl = price - sl_dist
         tp = price + tp_dist
@@ -1085,7 +1094,9 @@ async def monitor_trades():
                                     'UPDATE active_trades '
                                     'SET size=?,is_trailing=1,trailing_sl=?,partial_price=? '
                                     'WHERE id=?',
-                                    (partial_size, entry_price, close_price, tid)
+                                    # trailing_sl для SHORT стартует с close_price (цены TP1)
+                                    # и будет двигаться вниз вместе с ценой
+                                    (partial_size, close_price, close_price, tid)
                                 )
                                 bot.send_message(USER_ID,
                                     f'🎯 *ЧАСТИЧНОЕ ЗАКРЫТИЕ: {symbol}*\n'
@@ -1095,6 +1106,7 @@ async def monitor_trades():
                                     parse_mode='Markdown'
                                 )
                         else:
+                            # SHORT трейлинг: SL двигается вниз за ценой
                             new_tsl = min(trailing_sl, price + atr * 1.0)
                             if price >= trailing_sl or candle_high >= trailing_sl:
                                 close_trade(trade, max(price, candle_high), '📍 ТРЕЙЛИНГ СТОП')
@@ -1224,8 +1236,13 @@ async def macd_hunter():
                     # При развороте корреляцию не проверяем — уже в позиции
                     setup = analyze_symbol_macd(sym)
                     if setup and setup['side'] != side:
+                        # Проверяем лимит ДО закрытия — закрываем только если можем переоткрыть
+                        macd_count = _read_db(
+                            'SELECT COUNT(*) FROM active_trades WHERE macd_active=1',
+                            fetchone=True)[0]
                         close_trade(trade, setup['price'], '🔄 MACD разворот')
                         closed += 1
+                        # После закрытия лимит освободился — открываем новую
                         open_trade_macd(sym, setup['price'], setup['side'], setup['atr'])
                 except (ccxt.NetworkError, ccxt.ExchangeError) as e:
                     print(f'[MACD Monitor] Сеть {sym}: {e}')
@@ -1309,19 +1326,21 @@ def _score_symbol(symbol: str) -> dict | None:
                 score += 2
                 direction = 'long'
             else:
-                details.append('↓EMA50 4H')
+                score += 1          # медвежий тренд тоже даёт очко
+                direction = 'short'
 
         # EMA12 vs EMA26
         if not pd.isna(e12_val) and not pd.isna(e26_val) and e26_val != 0:
             diff_pct = abs(e12_val - e26_val) / e26_val * 100
             if e12_val > e26_val:
                 score += 2
-                direction = 'long'
+                direction = direction or 'long'
                 if diff_pct < 0.5:
                     details.append(f'EMA почти пересекаются ({diff_pct:.2f}%)')
             else:
+                score += 1
+                direction = direction or 'short'
                 if diff_pct < 1.0:
-                    score += 1
                     details.append(f'EMA близко к пересечению ({diff_pct:.2f}%)')
 
         # Доп. условия объёма и цены
@@ -1410,6 +1429,7 @@ def run_watchlist_scan(candidates: list) -> list:
             pass
         except Exception:
             pass
+        time.sleep(0.3)  # rate limit
 
     print()
     results.sort(key=lambda x: x['score'], reverse=True)
@@ -1447,7 +1467,7 @@ def _format_watchlist(found: list) -> str:
 # =====================================================================
 async def watchlist_hunter():
     # Ждём до следующего часа (00 минут)
-    now     = __import__('datetime').datetime.now()
+    now     = datetime.now()
     wait    = (60 - now.minute) * 60 - now.second
     if wait < 10:
         wait += 3600
@@ -1581,7 +1601,7 @@ def cmd_trades(msg):
             mode = (f'📍 Трейлинг SL: `{tsl:.6g}`\n  '
                     f'🔴 SL: `{sl:.6g}`')
         else:
-            tp1 = ep + (ep - sl) * 2.5
+            tp1 = ep + (ep - sl) * 2.5 if side == 'long' else ep - (sl - ep) * 2.5
             mode = (f'🎯 TP1: `{tp1:.6g}`\n  '
                     f'🔴 SL: `{sl:.6g}`\n  '
                     f'📏 R:R: `1 : 2.5`')
