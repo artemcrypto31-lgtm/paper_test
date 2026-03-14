@@ -103,6 +103,7 @@ BTC_CORR_MAX       = 0.8      # порог: монеты выше отсеива
 # Сетка запусков сканеров
 EMA_GRID_MINUTES  = 15        # EMA Cross: каждые 15 мин по сетке
 MACD_GRID_MINUTES = 30        # MACD:      каждые 30 мин по сетке
+WATCHLIST_INTERVAL = 3600     # Вотч-лист: каждые 60 минут
 
 BLACKLIST = {
     'LINK/USDT:USDT',
@@ -180,6 +181,8 @@ def is_correlated_with_btc(symbol: str, btc_closes: pd.Series) -> bool:
         sym_ret = closes.pct_change().dropna()
         btc_ret = btc_closes.pct_change().dropna()
         n = min(len(sym_ret), len(btc_ret))
+        if sym_ret.iloc[-n:].std() == 0 or btc_ret.iloc[-n:].std() == 0:
+            return False
         correlation = float(np.corrcoef(sym_ret.iloc[-n:].values, btc_ret.iloc[-n:].values)[0, 1])
         if abs(correlation) >= BTC_CORR_MAX:
             print(f'[Corr] {symbol}: отсев — корреляция BTC {correlation:.2f}')
@@ -350,19 +353,23 @@ def _bt_sma(arr: np.ndarray, n: int) -> np.ndarray:
     return result
 
 def _bt_rsi(arr: np.ndarray, n: int = 14) -> np.ndarray:
-    """RSI без NaN."""
+    """RSI без NaN, Wilder's EMA (RMA) — как в TradingView."""
+    delta    = np.diff(arr, prepend=arr[0])
+    gain     = np.where(delta > 0, delta, 0.0)
+    loss     = np.where(delta < 0, -delta, 0.0)
+    # Wilder's smoothing: alpha = 1/n (RMA)
+    avg_gain = np.empty(len(arr)); avg_gain[0] = gain[0]
+    avg_loss = np.empty(len(arr)); avg_loss[0] = loss[0]
+    alpha = 1.0 / n
+    for i in range(1, len(arr)):
+        avg_gain[i] = avg_gain[i-1] * (1 - alpha) + gain[i] * alpha
+        avg_loss[i] = avg_loss[i-1] * (1 - alpha) + loss[i] * alpha
     result = np.full(len(arr), 50.0)
-    delta = np.diff(arr, prepend=arr[0])
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
-    avg_gain = _bt_sma(gain, n)
-    avg_loss = _bt_sma(loss, n)
     for i in range(len(arr)):
         if avg_loss[i] == 0:
             result[i] = 100.0
         else:
-            rs = avg_gain[i] / avg_loss[i]
-            result[i] = 100.0 - 100.0 / (1.0 + rs)
+            result[i] = 100.0 - 100.0 / (1.0 + avg_gain[i] / avg_loss[i])
     return result
 
 def _bt_atr(h: np.ndarray, l: np.ndarray, c: np.ndarray, n: int = 14) -> np.ndarray:
@@ -916,11 +923,11 @@ def close_trade(trade: tuple, exit_price: float, reason: str):
 
     result = 'WIN' if pnl > 0 else ('LOSS' if pnl < 0 else 'BREAKEVEN')
 
-    # Атомарное обновление баланса — нет race condition
-    _write_db('UPDATE wallet SET balance = balance + ?', (pnl,))
+    # Синхронное обновление баланса — гарантируем что читаем актуальное значение
+    _write_db_sync('UPDATE wallet SET balance = balance + ?', (pnl,))
     _write_db('DELETE FROM active_trades WHERE id=?', (tid,))
 
-    # Читаем итоговый баланс уже после атомарного обновления
+    # Читаем итоговый баланс — гарантированно актуальный
     new_balance = _read_db('SELECT balance FROM wallet', fetchone=True)[0]
 
     _write_db(
@@ -1381,8 +1388,6 @@ def _format_watchlist(found: list) -> str:
 # =====================================================================
 # АВТО-ВОТЧ-ЛИСТ — раз в час ровно
 # =====================================================================
-WATCHLIST_INTERVAL = 3600  # каждые 60 минут
-
 async def watchlist_hunter():
     # Ждём до следующего часа (00 минут)
     now     = __import__('datetime').datetime.now()
@@ -2070,3 +2075,4 @@ if __name__ == '__main__':
         except Exception as e:
             print(f'Сетевой сбой: {e}. Перезапуск через 5 сек...')
             time.sleep(5)
+            
