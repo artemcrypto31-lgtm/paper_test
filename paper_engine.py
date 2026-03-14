@@ -15,10 +15,13 @@ import asyncio
 import math
 import sqlite3
 import os
+import signal
+import sys
 import numpy as np
 import telebot
 import threading
 import queue
+import logging
 import pandas as pd
 import ccxt
 import time
@@ -30,6 +33,42 @@ from backtesting import Backtest, Strategy
 from backtesting.lib import crossover
 
 warnings.filterwarnings('ignore', category=FutureWarning)
+
+# =====================================================================
+# ЛОГИРОВАНИЕ
+# =====================================================================
+def _setup_logging():
+    fmt = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    # Консоль
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    root.addHandler(ch)
+
+    # Файл — INFO и выше (ротация: 5 МБ × 3 файла)
+    from logging.handlers import RotatingFileHandler
+    fh = RotatingFileHandler('fortress.log', maxBytes=5*1024*1024,
+                              backupCount=3, encoding='utf-8')
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
+
+    # Отдельный файл только для ошибок
+    eh = RotatingFileHandler('fortress_errors.log', maxBytes=2*1024*1024,
+                              backupCount=2, encoding='utf-8')
+    eh.setLevel(logging.ERROR)
+    eh.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s\n%(exc_info)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    root.addHandler(eh)
+
+_setup_logging()
+log = logging.getLogger('fortress')
 
 # =====================================================================
 # ИНДИКАТОРЫ — чистый pandas/numpy (pandas 3.x совместимо, без pandas_ta)
@@ -164,7 +203,7 @@ def fetch_btc_closes() -> pd.Series | None:
         )
         return df['c'].reset_index(drop=True).iloc[-BTC_CORR_LIMIT:]
     except Exception as e:
-        print(f'[Corr] Не удалось загрузить BTC: {e}')
+        log.error(f'[Corr] Не удалось загрузить BTC: {e}', exc_info=True)
         return None
 
 
@@ -189,7 +228,7 @@ def is_correlated_with_btc(symbol: str, btc_closes: pd.Series) -> bool:
             return False
         correlation = float(np.corrcoef(sym_ret.iloc[-n:].values, btc_ret.iloc[-n:].values)[0, 1])
         if abs(correlation) >= BTC_CORR_MAX:
-            print(f'[Corr] {symbol}: отсев — корреляция BTC {correlation:.2f}')
+            log.warning(f'[Corr] {symbol}: отсев — корреляция BTC {correlation:.2f}')
             return True
         return False
     except Exception:
@@ -217,12 +256,12 @@ def db_worker():
                 if result_holder is not None:
                     result_holder['lastrowid'] = cur.lastrowid
             except Exception as e:
-                print(f'[DB Worker] Ошибка: {e} | SQL: {sql}')
+                log.error(f'[DB Worker] Ошибка: {e} | SQL: {sql}', exc_info=True)
             finally:
                 if result_event:
                     result_event.set()
         except Exception as e:
-            print(f'[DB Worker] Критическая ошибка: {e}')
+            log.error(f'[DB Worker] Критическая ошибка: {e}', exc_info=True)
 
 
 def _write_db(sql: str, params: tuple = ()):
@@ -317,17 +356,17 @@ def init_db():
         if col not in existing_at:
             try:
                 conn.execute(sql); conn.commit()
-                print(f'[DB] +{col} в active_trades')
+                log.info(f'[DB] +{col} в active_trades')
             except Exception as e:
-                print(f'[DB] Миграция {col}: {e}')
+                log.error(f'[DB] Миграция {col}: {e}', exc_info=True)
 
     if 'scanner' not in existing_tl:
         try:
             conn.execute("ALTER TABLE trade_log ADD COLUMN scanner TEXT DEFAULT 'ema'")
             conn.commit()
-            print('[DB] +scanner в trade_log')
+            log.info('[DB] +scanner в trade_log')
         except Exception as e:
-            print(f'[DB] Миграция scanner в trade_log: {e}')
+            log.error(f'[DB] Миграция scanner в trade_log: {e}', exc_info=True)
 
     conn.close()
 
@@ -616,10 +655,10 @@ def analyze_symbol(symbol: str, btc_closes: pd.Series | None = None):
     try:
         adx_val = _adx(df4h['h'], df4h['l'], df4h['c'], 14).iloc[-2]
         if not pd.isna(adx_val) and adx_val < 25:
-            print(f'[EMA] {symbol}: отсев — ADX {adx_val:.1f} < 25 (боковик)')
+            log.warning(f'[EMA] {symbol}: отсев — ADX {adx_val:.1f} < 25 (боковик)')
             return None
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f'[EMA] {symbol}: ADX не посчитан ({e}) — фильтр пропущен')
 
     # ── 1H: индикаторы ───────────────────────────────────────────────
     df = pd.DataFrame(
@@ -753,7 +792,7 @@ def run_radar_scan() -> list:
         except (ccxt.NetworkError, ccxt.ExchangeError):
             pass
         except Exception as e:
-            print(f'[Radar] {sym}: {e}')
+            log.error(f'[Radar] {sym}: {e}', exc_info=True)
     print()
     found.sort(key=lambda x: (x['signals'], x['change_6h']), reverse=True)
     return found
@@ -814,7 +853,7 @@ def open_trade_ema(symbol: str, price: float, atr_val: float, side: str = 'long'
         candles = exchange.fetch_ohlcv(symbol, '1h', limit=3)
         change  = abs((price / candles[-2][4] - 1) * 100)
         if change > 5.0:
-            print(f'[EMA] Пропуск {symbol}: {change:.1f}% за час')
+            log.warning(f'[EMA] Пропуск {symbol}: {change:.1f}% за час')
             return False
     except (ccxt.NetworkError, ccxt.ExchangeError):
         pass
@@ -824,7 +863,7 @@ def open_trade_ema(symbol: str, price: float, atr_val: float, side: str = 'long'
         'SELECT COUNT(*) FROM active_trades WHERE macd_active=0',
         fetchone=True)[0]
     if ema_count >= MAX_EMA_TRADES:
-        print(f'[EMA] Лимит {MAX_EMA_TRADES} сделок достигнут — пропуск {symbol}')
+        log.warning(f'[EMA] Лимит {MAX_EMA_TRADES} сделок достигнут — пропуск {symbol}')
         return False
 
     balance = _read_db('SELECT balance FROM wallet', fetchone=True)[0]
@@ -834,14 +873,14 @@ def open_trade_ema(symbol: str, price: float, atr_val: float, side: str = 'long'
         try:
             p = exchange.fetch_ticker(sym)['last']
             unrealized += (p - ep) * sz if sd == 'long' else (ep - p) * sz
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f'[EMA] Не удалось получить цену {sym} для unrealized: {e}')
     equity  = balance + unrealized
     sl_dist = atr_val * ATR_MULT_SL
     # Защита от аномально маленького ATR — минимум 0.1% от цены
     min_sl_dist = price * 0.001
     if sl_dist < min_sl_dist:
-        print(f'[EMA] Пропуск {symbol}: sl_dist слишком мал ({sl_dist:.8f})')
+        log.warning(f'[EMA] Пропуск {symbol}: sl_dist слишком мал ({sl_dist:.8f})')
         return False
     size = (equity * RISK_PER_TRADE) / sl_dist
 
@@ -864,7 +903,7 @@ def open_trade_ema(symbol: str, price: float, atr_val: float, side: str = 'long'
              datetime.now().strftime('%Y-%m-%d %H:%M:%S'), balance, 'ema')
         )
     except Exception as e:
-        print(f'[EMA] Не удалось открыть {symbol}: {e}')
+        log.error(f'[EMA] Не удалось открыть {symbol}: {e}', exc_info=True)
         return False
 
     icon = '🚀' if side == 'long' else '🔻'
@@ -892,7 +931,7 @@ def open_trade_macd(symbol: str, price: float, side: str, atr_val: float) -> boo
         'SELECT COUNT(*) FROM active_trades WHERE macd_active=1',
         fetchone=True)[0]
     if macd_count >= MAX_MACD_TRADES:
-        print(f'[MACD] Лимит {MAX_MACD_TRADES} сделок достигнут — пропуск {symbol}')
+        log.warning(f'[MACD] Лимит {MAX_MACD_TRADES} сделок достигнут — пропуск {symbol}')
         return False
 
     balance = _read_db('SELECT balance FROM wallet', fetchone=True)[0]
@@ -902,8 +941,8 @@ def open_trade_macd(symbol: str, price: float, side: str, atr_val: float) -> boo
         try:
             p = exchange.fetch_ticker(sym)['last']
             unrealized += (p - ep) * sz if sd == 'long' else (ep - p) * sz
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f'[MACD] Не удалось получить цену {sym} для unrealized: {e}')
     equity = balance + unrealized
 
     # SL и TP на основе ATR (RR = 1:2.5)
@@ -912,7 +951,7 @@ def open_trade_macd(symbol: str, price: float, side: str, atr_val: float) -> boo
     # Защита от аномально маленького ATR
     min_sl_dist = price * 0.001
     if sl_dist < min_sl_dist:
-        print(f'[MACD] Пропуск {symbol}: sl_dist слишком мал ({sl_dist:.8f})')
+        log.warning(f'[MACD] Пропуск {symbol}: sl_dist слишком мал ({sl_dist:.8f})')
         return False
     if side == 'long':
         sl = price - sl_dist
@@ -935,7 +974,7 @@ def open_trade_macd(symbol: str, price: float, side: str, atr_val: float) -> boo
              datetime.now().strftime('%Y-%m-%d %H:%M:%S'), balance, 'macd')
         )
     except Exception as e:
-        print(f'[MACD] Не удалось открыть {symbol}: {e}')
+        log.error(f'[MACD] Не удалось открыть {symbol}: {e}', exc_info=True)
         return False
 
     icon = '🟢' if side == 'long' else '🔴'
@@ -1115,12 +1154,12 @@ async def monitor_trades():
                                           (new_tsl, tid))
 
                 except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-                    print(f'[Monitor] Сеть {symbol}: {e}')
+                    log.error(f'[Monitor] Сеть {symbol}: {e}', exc_info=True)
                 except Exception as e:
-                    print(f'[Monitor] Ошибка {symbol}: {e}')
+                    log.error(f'[Monitor] Ошибка {symbol}: {e}', exc_info=True)
 
         except Exception as e:
-            print(f'[Monitor] Критическая ошибка: {e}')
+            log.error(f'[Monitor] Критическая ошибка: {e}', exc_info=True)
 
         await asyncio.sleep(MONITOR_INTERVAL)
 
@@ -1129,7 +1168,7 @@ async def monitor_trades():
 # =====================================================================
 async def signal_hunter():
     wait = seconds_until_next_grid(EMA_GRID_MINUTES)
-    print(f'[EMA] Первый скан через {wait/60:.1f} мин')
+    log.info(f'[EMA] Первый скан через {wait/60:.1f} мин')
     await asyncio.sleep(wait)
 
     while True:
@@ -1143,7 +1182,7 @@ async def signal_hunter():
                 try:
                     tickers = exchange.fetch_tickers(); break
                 except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-                    print(f'[EMA] Попытка {attempt+1}/3: {e}')
+                    log.error(f'[EMA] Попытка {attempt+1}/3: {e}', exc_info=True)
                     await asyncio.sleep(30)
 
             if tickers is None:
@@ -1159,7 +1198,7 @@ async def signal_hunter():
             # Загружаем BTC один раз для всего скана
             btc_closes = fetch_btc_closes()
             if btc_closes is None:
-                print('[EMA] BTC данные недоступны — фильтр корреляции отключён')
+                log.warning('[EMA] BTC данные недоступны — фильтр корреляции отключён')
 
             found = 0
             for i, sym in enumerate(candidates, 1):
@@ -1170,9 +1209,9 @@ async def signal_hunter():
                             setup['symbol'], setup['price'], setup['atr'], setup['side']):
                         found += 1
                 except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-                    print(f'[EMA] Сеть {sym}: {e}')
+                    log.error(f'[EMA] Сеть {sym}: {e}', exc_info=True)
                 except Exception as e:
-                    print(f'[EMA] Ошибка {sym}: {e}')
+                    log.error(f'[EMA] Ошибка {sym}: {e}', exc_info=True)
                 await asyncio.sleep(0.3)
 
             print()
@@ -1181,7 +1220,7 @@ async def signal_hunter():
                 parse_mode='Markdown')
 
         except Exception as e:
-            print(f'[EMA Scanner] Критическая ошибка: {e}')
+            log.error(f'[EMA Scanner] Критическая ошибка: {e}', exc_info=True)
 
         await asyncio.sleep(seconds_until_next_grid(EMA_GRID_MINUTES))
 
@@ -1190,7 +1229,7 @@ async def signal_hunter():
 # =====================================================================
 async def macd_hunter():
     wait = seconds_until_next_grid(MACD_GRID_MINUTES)
-    print(f'[MACD] Первый скан через {wait/60:.1f} мин')
+    log.info(f'[MACD] Первый скан через {wait/60:.1f} мин')
     await asyncio.sleep(wait)
 
     while True:
@@ -1204,7 +1243,7 @@ async def macd_hunter():
                 try:
                     tickers = exchange.fetch_tickers(); break
                 except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-                    print(f'[MACD] Попытка {attempt+1}/3: {e}')
+                    log.error(f'[MACD] Попытка {attempt+1}/3: {e}', exc_info=True)
                     await asyncio.sleep(30)
 
             if tickers is None:
@@ -1220,7 +1259,7 @@ async def macd_hunter():
             # Загружаем BTC один раз для всего скана
             btc_closes = fetch_btc_closes()
             if btc_closes is None:
-                print('[MACD] BTC данные недоступны — фильтр корреляции отключён')
+                log.warning('[MACD] BTC данные недоступны — фильтр корреляции отключён')
 
             # ── Шаг 1: проверяем выходы из открытых MACD сделок ──────
             macd_trades = _read_db(
@@ -1245,9 +1284,9 @@ async def macd_hunter():
                         # После закрытия лимит освободился — открываем новую
                         open_trade_macd(sym, setup['price'], setup['side'], setup['atr'])
                 except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-                    print(f'[MACD Monitor] Сеть {sym}: {e}')
+                    log.error(f'[MACD Monitor] Сеть {sym}: {e}', exc_info=True)
                 except Exception as e:
-                    print(f'[MACD Monitor] Ошибка {sym}: {e}')
+                    log.error(f'[MACD Monitor] Ошибка {sym}: {e}', exc_info=True)
 
             # ── Шаг 2: ищем новые входы ───────────────────────────────
             found_long = 0; found_short = 0
@@ -1262,9 +1301,9 @@ async def macd_hunter():
                             else:
                                 found_short += 1
                 except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-                    print(f'[MACD] Сеть {sym}: {e}')
+                    log.error(f'[MACD] Сеть {sym}: {e}', exc_info=True)
                 except Exception as e:
-                    print(f'[MACD] Ошибка {sym}: {e}')
+                    log.error(f'[MACD] Ошибка {sym}: {e}', exc_info=True)
                 await asyncio.sleep(0.3)
 
             print()
@@ -1275,7 +1314,7 @@ async def macd_hunter():
                 parse_mode='Markdown')
 
         except Exception as e:
-            print(f'[MACD Scanner] Критическая ошибка: {e}')
+            log.error(f'[MACD Scanner] Критическая ошибка: {e}', exc_info=True)
 
         await asyncio.sleep(seconds_until_next_grid(MACD_GRID_MINUTES))
 
@@ -1471,7 +1510,7 @@ async def watchlist_hunter():
     wait    = (60 - now.minute) * 60 - now.second
     if wait < 10:
         wait += 3600
-    print(f'[Watch] Первый скан через {wait/60:.1f} мин')
+    log.info(f'[Watch] Первый скан через {wait/60:.1f} мин')
     await asyncio.sleep(wait)
 
     while True:
@@ -1488,11 +1527,11 @@ async def watchlist_hunter():
                     _format_watchlist(watchlist),
                     parse_mode='Markdown')
             else:
-                print('[Watch] Вотч-лист: монет не найдено')
+                log.warning('[Watch] Вотч-лист: монет не найдено')
         except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-            print(f'[Watch] Сеть: {e}')
+            log.error(f'[Watch] Сеть: {e}', exc_info=True)
         except Exception as e:
-            print(f'[Watch] Ошибка: {e}')
+            log.error(f'[Watch] Ошибка: {e}', exc_info=True)
 
         await asyncio.sleep(WATCHLIST_INTERVAL)
 
@@ -1515,9 +1554,9 @@ async def pump_radar():
                     _format_radar_results(found, 'РАДАР ПАМПА (авто)'),
                     parse_mode='Markdown')
         except (ccxt.NetworkError, ccxt.ExchangeError) as e:
-            print(f'[Radar] Сеть: {e}')
+            log.error(f'[Radar] Сеть: {e}', exc_info=True)
         except Exception as e:
-            print(f'[Radar] Ошибка: {e}')
+            log.error(f'[Radar] Ошибка: {e}', exc_info=True)
 
 # =====================================================================
 # TELEGRAM HANDLERS
@@ -2106,7 +2145,7 @@ async def _guarded(coro_fn, name: str):
             raise
         except Exception as e:
             err_msg = str(e)[:300]
-            print(f'[{name}] Авария: {err_msg} — перезапуск через 10 сек')
+            log.info(f'[{name}] Авария: {err_msg} — перезапуск через 10 сек')
             try:
                 bot.send_message(USER_ID,
                     f'🚨 *{name} УПАЛ*\n`{err_msg}`\n'
@@ -2127,28 +2166,80 @@ async def main_async():
     )
 
 
+# =====================================================================
+# GRACEFUL SHUTDOWN
+# =====================================================================
+_shutdown_event = threading.Event()
+
+def _graceful_shutdown(signum, frame):
+    """
+    Перехватывает SIGINT (Ctrl+C) и SIGTERM (kill/systemd stop).
+    Даёт DB Worker время записать все оставшиеся операции.
+    """
+    sig_name = 'SIGINT' if signum == signal.SIGINT else 'SIGTERM'
+    log.info(f'[Shutdown] Получен {sig_name} — начинаю мягкое завершение...')
+
+    # Уведомляем в Telegram если возможно
+    try:
+        bot.send_message(USER_ID,
+            '⚠️ *Fortress останавливается* (получен сигнал завершения)\n'
+            'Жду сброса очереди БД...',
+            parse_mode='Markdown')
+    except Exception:
+        pass
+
+    # Ждём пока очередь БД полностью опустеет (макс 15 сек)
+    log.info('[Shutdown] Жду опустошения очереди БД...')
+    deadline = time.time() + 15
+    while not _db_queue.empty() and time.time() < deadline:
+        time.sleep(0.1)
+
+    if _db_queue.empty():
+        log.info('[Shutdown] Очередь БД пуста — все данные записаны ✅')
+    else:
+        log.warning('[Shutdown] Таймаут ожидания очереди БД — часть операций могла не записаться!')
+
+    # Сигнал db_worker завершить работу
+    _db_queue.put(None)
+
+    try:
+        bot.send_message(USER_ID,
+            '🛑 *Fortress остановлен* | Все данные сохранены',
+            parse_mode='Markdown')
+    except Exception:
+        pass
+
+    log.info('[Shutdown] Завершение.')
+    sys.exit(0)
+
+
 if __name__ == '__main__':
+    # Регистрируем обработчики сигналов
+    signal.signal(signal.SIGINT,  _graceful_shutdown)
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+
     init_db()
 
-    print('🛡️  Fortress Paper Trading V4.6')
-    print(f'   Режим: {"РЕАЛЬНАЯ ТОРГОВЛЯ" if LIVE_TRADING else "Бумажная торговля"}')
-    print(f'   EMA Grid:  каждые {EMA_GRID_MINUTES} мин')
-    print(f'   MACD Grid: каждые {MACD_GRID_MINUTES} мин')
+    log.info('🛡️  Fortress Paper Trading V4.6')
+    log.info(f'   Режим: {"РЕАЛЬНАЯ ТОРГОВЛЯ" if LIVE_TRADING else "Бумажная торговля"}')
+    log.info(f'   EMA Grid:  каждые {EMA_GRID_MINUTES} мин')
+    log.info(f'   MACD Grid: каждые {MACD_GRID_MINUTES} мин')
 
     db_thread = threading.Thread(target=db_worker, daemon=True)
     db_thread.start()
-    print('   DB Worker: запущен')
+    log.info('   DB Worker: запущен')
 
     threading.Thread(
         target=lambda: asyncio.run(main_async()),
         daemon=True
     ).start()
-    print('   Async loop: запущен')
+    log.info('   Async loop: запущен')
 
     while True:
         try:
-            print('📡 Бот слушает Telegram...')
+            log.info('📡 Бот слушает Telegram...')
             bot.infinity_polling(timeout=90, long_polling_timeout=90)
         except Exception as e:
-            print(f'Сетевой сбой: {e}. Перезапуск через 5 сек...')
+            log.error(f'Сетевой сбой: {e}. Перезапуск через 5 сек...', exc_info=True)
             time.sleep(5)
+            
