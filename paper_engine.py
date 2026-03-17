@@ -468,30 +468,49 @@ def cmd_balance(msg):
 @bot.message_handler(func=lambda m: m.text == '⚔️ СДЕЛКИ')
 def cmd_trades(msg):
     def _run():
-        trades = _read_db('SELECT symbol,side,entry_price,sl,is_trailing,trailing_sl,entry_time,size,strategy FROM active_trades')
-        if not trades:
-            bot.send_message(USER_ID, '⚔️ Активных сделок нет.')
-            return
-            
-        text = '⚔️ *АКТИВНЫЕ СДЕЛКИ:*\n\n'
-        for sym, side, ep, sl, is_tr, tsl, et, sz, strategy in trades:
-            t = et[5:16] if et else '—'
-            icon = '⏱️' if strategy == 'ema_multi_15m' else '🕰️'
-            try:
-                cur_price = exchange.fetch_ticker(sym)['last']
-                net_pnl = ((cur_price - ep) * sz if side == 'long' else (ep - cur_price) * sz) - ((ep * sz * FEE_RATE) + (cur_price * sz * FEE_RATE))
-                pnl_str = f'{"🟢" if net_pnl >= 0 else "🔴"} PnL: `{net_pnl:+.2f}` | Цена: `{cur_price:.6g}`\n  '
-            except: pnl_str = ''
-
-            if is_tr:
-                mode = f'📍 T-SL: `{tsl:.6g}`\n  🔴 SL: `{sl:.6g}`'
-            else:
-                tp1 = ep + (ep - sl) * 2.5 if side == 'long' else ep - (sl - ep) * 2.5
-                mode = f'🎯 TP1: `{tp1:.6g}`\n  🔴 SL: `{sl:.6g}`'
+        try:
+            trades = _read_db(
+                'SELECT symbol,side,entry_price,sl,is_trailing,trailing_sl,entry_time,size,strategy '
+                'FROM active_trades'
+            )
+            if not trades:
+                bot.send_message(USER_ID, '⚔️ Активных сделок нет.')
+                return
                 
-            text += f'{icon} *{sym}* ({strategy}) | {side.upper()} | {t}\n  {pnl_str}{mode}\n\n'
+            text = '⚔️ *АКТИВНЫЕ СДЕЛКИ:*\n\n'
+            for sym, side, ep, sl, is_tr, tsl, et, sz, strategy in trades:
+                t = et[5:16] if et else '—'
+                icon = '⏱️' if '15m' in strategy else '🕰️'
+                
+                # Экранируем подчеркивания в названии стратегии для Markdown
+                safe_strategy = strategy.replace('_', '\\_')
+                
+                try:
+                    cur_price = exchange.fetch_ticker(sym)['last']
+                    net_pnl = ((cur_price - ep) * sz if side == 'long' else (ep - cur_price) * sz) - ((ep * sz * FEE_RATE) + (cur_price * sz * FEE_RATE))
+                    pnl_str = f'{"🟢" if net_pnl >= 0 else "🔴"} PnL: `{net_pnl:+.2f}` | Цена: `{cur_price:.6g}`\n  '
+                except: 
+                    pnl_str = ''
+
+                if is_tr:
+                    mode = f'📍 T-SL: `{tsl:.6g}`\n  🔴 SL: `{sl:.6g}`'
+                else:
+                    tp1 = ep + (ep - sl) * 2.5 if side == 'long' else ep - (sl - ep) * 2.5
+                    mode = f'🎯 TP1: `{tp1:.6g}`\n  🔴 SL: `{sl:.6g}`'
+                    
+                text += f'{icon} *{sym}* ({safe_strategy}) | {side.upper()} | {t}\n  {pnl_str}{mode}\n\n'
             
-        bot.send_message(USER_ID, text, parse_mode='Markdown')
+            # Финальная защита от падения Telegram API
+            try:
+                bot.send_message(USER_ID, text, parse_mode='Markdown')
+            except:
+                # Если Markdown всё равно не пролез, шлем простым текстом
+                clean_text = text.replace('*', '').replace('`', '').replace('\\_', '_')
+                bot.send_message(USER_ID, clean_text)
+                
+        except Exception as e:
+            log.error(f'[UI Error] Ошибка кнопки сделок: {e}', exc_info=True)
+            
     thread_pool.submit(_run)
 
 @bot.message_handler(func=lambda m: m.text == '📈 СТАТИСТИКА')
