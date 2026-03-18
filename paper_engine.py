@@ -47,18 +47,22 @@ USER_ID = int(os.getenv('USER_ID'))
 
 STARTING_BALANCE  = 1000.0
 MIN_VOLUME_24H    = 120_000_000.0
-MIN_NATR          = 1.5       # Защита от пилы
-ADX_1H_THRESHOLD  = 30        # Жесткий фильтр тренда для 1H
-ADX_15M_THRESHOLD = 20        # Смягченный фильтр тренда для Smart Money 15m
+MIN_NATR          = 1.5       
+ADX_1H_THRESHOLD  = 30        
+ADX_15M_THRESHOLD = 20        
 RISK_PER_TRADE    = 0.01      
-ATR_MULT_SL       = 2.0       
 MONITOR_INTERVAL  = 60        
 
-# Сетки сканирования
+# --- НОВЫЕ ЖЕСТКИЕ ПАРАМЕТРЫ РИСК-МЕНЕДЖМЕНТА ---
+MAX_STOP_PERCENT = 5.0  # Максимально допустимый размер стопа в % (Отбраковка)
+MIN_RR = 2.0            # Минимальное соотношение Risk:Reward
+MAX_ATR_TP = 3.5        # Максимальная дистанция Тейка в ATR (защита от нереалистичных целей)
+LOOKBACK_SWING = 8      # Свечей для поиска технического экстремума (Swing High/Low)
+# ------------------------------------------------
+
 GRID_1H_MINUTES   = 60
 GRID_15M_MINUTES  = 15
 
-# Реальная комиссия (Binance Futures Taker)
 FEE_RATE = 0.0005 
 
 BLACKLIST = {'LINK/USDT:USDT', 'SOL/USDT:USDT', 'LTC/USDT:USDT', 'XMR/USDT:USDT', 'USDC/USDT:USDT'}
@@ -93,22 +97,18 @@ def _adx(h: pd.Series, l: pd.Series, c: pd.Series, n: int = 14) -> pd.Series:
     return dx.ewm(alpha=1/n, adjust=False).mean()
 
 def is_liquidity_sweep(df: pd.DataFrame, side: str):
-    """Ищет снятие ликвидности в последних 3-х закрытых свечах"""
     for i in range(-3, 0):
         curr_l, curr_h, curr_c = df['l'].iloc[i], df['h'].iloc[i], df['c'].iloc[i]
         prev_l = df['l'].iloc[-18:i].min() if i < -1 else df['l'].iloc[-18:-1].min()
         prev_h = df['h'].iloc[-18:i].max() if i < -1 else df['h'].iloc[-18:-1].max()
-        
         if side == 'long':
-            # Прокол локального дна и закрытие выше него (Rejection)
             if curr_l < prev_l and curr_c > prev_l: return True
         else:
-            # Прокол локального хая и закрытие ниже него
             if curr_h > prev_h and curr_c < prev_h: return True
     return False
 
 # =====================================================================
-# БАЗА ДАННЫХ (Атомарные транзакции)
+# БАЗА ДАННЫХ
 # =====================================================================
 _db_queue = queue.Queue()
 DB_PATH   = 'paper_trading.db'
@@ -206,7 +206,6 @@ def is_correlated_with_btc(symbol: str, btc_closes: pd.Series) -> bool:
     except: return False
 
 def analyze_1h(symbol: str, btc_closes: pd.Series | None = None):
-    """Стратегия 1: Глобальный тренд 1H"""
     if btc_closes is not None and is_correlated_with_btc(symbol, btc_closes): return None
 
     df4h = pd.DataFrame(exchange.fetch_ohlcv(symbol, '4h', limit=200), columns=['ts', 'o', 'h', 'l', 'c', 'v'])
@@ -227,8 +226,12 @@ def analyze_1h(symbol: str, btc_closes: pd.Series | None = None):
     if pd.isna(atr_val) or pd.isna(e12) or pd.isna(e26) or atr_val <= 0: return None
     if (atr_val / c.iloc[-2]) * 100 < MIN_NATR: return None
 
-    if above_ema50 and e12 > e26: side = 'long'
-    elif not above_ema50 and e12 < e26: side = 'short'
+    if above_ema50 and e12 > e26: 
+        side = 'long'
+        extremum = l.iloc[-LOOKBACK_SWING-1:-1].min() # Ищем локальное дно
+    elif not above_ema50 and e12 < e26: 
+        side = 'short'
+        extremum = h.iloc[-LOOKBACK_SWING-1:-1].max() # Ищем локальный хай
     else: return None
 
     vol_ma = v.rolling(20).mean()
@@ -236,10 +239,9 @@ def analyze_1h(symbol: str, btc_closes: pd.Series | None = None):
             (c.iloc[-2] > c.iloc[-3]) if side=='long' else (c.iloc[-2] < c.iloc[-3]), 
             v.iloc[-2] > vol_ma.iloc[-2] * 1.5]) < 2: return None
 
-    return {'symbol': symbol, 'price': c.iloc[-2], 'atr': atr_val, 'side': side, 'strategy': 'ema_1h'}
+    return {'symbol': symbol, 'price': c.iloc[-2], 'atr': atr_val, 'side': side, 'strategy': 'ema_1h', 'extremum': extremum}
 
 def analyze_15m(symbol: str, btc_closes: pd.Series | None = None):
-    """Стратегия 2: Smart Money 15m (Ликвидность)"""
     if btc_closes is not None and is_correlated_with_btc(symbol, btc_closes): return None
 
     df4h = pd.DataFrame(exchange.fetch_ohlcv(symbol, '4h', limit=100), columns=['ts', 'o', 'h', 'l', 'c', 'v'])
@@ -258,17 +260,56 @@ def analyze_15m(symbol: str, btc_closes: pd.Series | None = None):
     if pd.isna(atr_val) or pd.isna(e12_15) or pd.isna(e26_15) or atr_val <= 0: return None
     if (atr_val / c.iloc[-1]) * 100 < (MIN_NATR * 0.5): return None
 
-    trend_side = 'long' if e12_15 > e26_15 else 'short'
+    if e12_15 > e26_15:
+        trend_side = 'long'
+        extremum = l.iloc[-LOOKBACK_SWING:].min()
+    else:
+        trend_side = 'short'
+        extremum = h.iloc[-LOOKBACK_SWING:].max()
 
     if not is_liquidity_sweep(df15m, trend_side):
         return None
 
-    return {'symbol': symbol, 'price': c.iloc[-1], 'atr': atr_val, 'side': trend_side, 'strategy': 'smart_15m'}
+    return {'symbol': symbol, 'price': c.iloc[-1], 'atr': atr_val, 'side': trend_side, 'strategy': 'smart_15m', 'extremum': extremum}
 
 def open_trade(setup: dict) -> bool:
     symbol = setup['symbol']
+    price = setup['price']
+    atr = setup['atr']
+    extremum = setup['extremum']
+    side = setup['side']
+
     if _read_db('SELECT 1 FROM active_trades WHERE symbol=?', (symbol,), fetchone=True):
         return False
+
+    # --- МАТЕМАТИЧЕСКИЙ ФИЛЬТР (ЯДРО ЗАЩИТЫ) ---
+    if side == 'long':
+        sl = extremum - (atr * 1.5)
+        sl_dist = price - sl
+    else:
+        sl = extremum + (atr * 1.5)
+        sl_dist = sl - price
+
+    # Защита от кривых экстремумов (если цена уже ушла за него)
+    if sl_dist <= price * 0.001: 
+        return False
+
+    risk_pct = (sl_dist / price) * 100
+    
+    # ФИЛЬТР 1: Отбраковка огромных стопов
+    if risk_pct > MAX_STOP_PERCENT:
+        log.info(f'[{symbol}] Сделка отклонена: Стоп-лосс {risk_pct:.2f}% превышает лимит {MAX_STOP_PERCENT}%')
+        return False
+
+    tp_dist = sl_dist * MIN_RR
+    
+    # ФИЛЬТР 2: Отбраковка нереалистичных тейков
+    if tp_dist > (atr * MAX_ATR_TP):
+        log.info(f'[{symbol}] Сделка отклонена: Тейк требует нереалистичного движения (>{MAX_ATR_TP} ATR)')
+        return False
+
+    tp = price + tp_dist if side == 'long' else price - tp_dist
+    # ---------------------------------------------
 
     balance = _read_db('SELECT balance FROM wallet', fetchone=True)[0]
     trades  = _read_db('SELECT symbol,side,entry_price,size FROM active_trades')
@@ -280,27 +321,24 @@ def open_trade(setup: dict) -> bool:
         except: pass
     
     equity = balance + unrealized
-    sl_dist = setup['atr'] * ATR_MULT_SL
-    if sl_dist < setup['price'] * 0.001: return False
-    
     size = (equity * RISK_PER_TRADE) / sl_dist
-    sl = setup['price'] - sl_dist if setup['side'] == 'long' else setup['price'] + sl_dist
 
     try:
+        # Пишем в базу РАССЧИТАННЫЙ tp вместо NULL
         _write_db_transaction([
-            ('INSERT INTO active_trades (symbol,side,entry_price,size,sl,tp,entry_time,strategy) VALUES (?,?,?,?,?,NULL,?,?)',
-             (symbol, setup['side'], setup['price'], size, sl, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), setup['strategy']))
+            ('INSERT INTO active_trades (symbol,side,entry_price,size,sl,tp,entry_time,strategy) VALUES (?,?,?,?,?,?,?,?)',
+             (symbol, side, price, size, sl, tp, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), setup['strategy']))
         ], sync=True)
     except Exception as e:
         log.error(f'Ошибка входа {symbol}: {e}')
         return False
 
-    tp1 = setup['price'] - sl_dist * 2.5 if setup['side'] == 'short' else setup['price'] + sl_dist * 2.5
     icon = '⏱️' if '15m' in setup['strategy'] else '🕰️'
     bot.send_message(USER_ID, 
         f'{icon} *ВХОД ({setup["strategy"]}): {symbol}*\n'
-        f'Тип: *{setup["side"].upper()}* | Цена: `{setup["price"]:.6g}`\n'
-        f'🔴 SL: `{sl:.6g}` | 🎯 TP1: `{tp1:.6g}`', 
+        f'Тип: *{side.upper()}* | Цена: `{price:.6g}`\n'
+        f'Риск сделки: `{risk_pct:.2f}%` от точки входа\n'
+        f'🔴 SL: `{sl:.6g}` | 🎯 TP1: `{tp:.6g}`', 
         parse_mode='Markdown')
     return True
 
@@ -354,8 +392,7 @@ async def monitor_trades():
 
                     if side == 'long':
                         sl_hit = price <= sl or candle_low <= sl
-                        tp1 = entry_price + (entry_price - sl) * 2.5
-                        tp1_hit = price >= tp1 or candle_high >= tp1
+                        tp1_hit = price >= tp or candle_high >= tp # ИСПОЛЬЗУЕМ TP ИЗ БАЗЫ
                         
                         if not is_trailing:
                             if sl_hit: close_trade(trade, min(price, candle_low), '🔴 STOP-LOSS')
@@ -382,8 +419,7 @@ async def monitor_trades():
 
                     else: 
                         sl_hit = price >= sl or candle_high >= sl
-                        tp1 = entry_price - (sl - entry_price) * 2.5
-                        tp1_hit = price <= tp1 or candle_low <= tp1
+                        tp1_hit = price <= tp or candle_low <= tp # ИСПОЛЬЗУЕМ TP ИЗ БАЗЫ
 
                         if not is_trailing:
                             if sl_hit: close_trade(trade, max(price, candle_high), '🔴 STOP-LOSS')
@@ -480,7 +516,7 @@ def cmd_balance(msg):
 def cmd_trades(msg):
     def _run():
         try:
-            trades = _read_db('SELECT id,symbol,side,entry_price,sl,is_trailing,trailing_sl,entry_time,size,strategy FROM active_trades')
+            trades = _read_db('SELECT id,symbol,side,entry_price,sl,tp,is_trailing,trailing_sl,entry_time,size,strategy FROM active_trades')
             if not trades:
                 bot.send_message(USER_ID, '⚔️ Активных сделок нет.')
                 return
@@ -489,7 +525,7 @@ def cmd_trades(msg):
             markup = types.InlineKeyboardMarkup(row_width=2)
             buttons = []
             
-            for tid, sym, side, ep, sl, is_tr, tsl, et, sz, strategy in trades:
+            for tid, sym, side, ep, sl, tp, is_tr, tsl, et, sz, strategy in trades:
                 t = et[5:16] if et else '—'
                 icon = '⏱️' if '15m' in strategy else '🕰️'
                 safe_strategy = strategy.replace('_', '\\_')
@@ -503,8 +539,7 @@ def cmd_trades(msg):
                 if is_tr:
                     mode = f'\n  📍 T-SL: `{tsl:.6g}`\n  🔴 SL: `{sl:.6g}`'
                 else:
-                    tp1 = ep + (ep - sl) * 2.5 if side == 'long' else ep - (sl - ep) * 2.5
-                    mode = f'\n  🎯 TP1: `{tp1:.6g}`\n  🔴 SL: `{sl:.6g}`'
+                    mode = f'\n  🎯 TP1: `{tp:.6g}`\n  🔴 SL: `{sl:.6g}`'
                     
                 text += f'{icon} *{sym}* ({safe_strategy}) | {side.upper()} | {t}\n  {pnl_str}{mode}\n\n'
                 
