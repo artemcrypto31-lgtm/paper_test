@@ -47,7 +47,8 @@ USER_ID = int(os.getenv('USER_ID'))
 
 STARTING_BALANCE  = 1000.0
 MIN_VOLUME_24H    = 120_000_000.0
-MIN_NATR          = 1.0
+MIN_NATR          = 1.5       # Увеличена волатильность для защиты от пилы
+ADX_THRESHOLD     = 30        # Жесткий фильтр тренда
 RISK_PER_TRADE    = 0.01      
 ATR_MULT_SL       = 2.0       
 MONITOR_INTERVAL  = 60        
@@ -69,7 +70,7 @@ exchange = ccxt.binance({'options': {'defaultType': 'future'}, 'enableRateLimit'
 thread_pool = ThreadPoolExecutor(max_workers=5)
 
 # =====================================================================
-# ИНДИКАТОРЫ
+# ИНДИКАТОРЫ & SMART MONEY
 # =====================================================================
 def _ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(span=n, adjust=False).mean()
@@ -89,6 +90,26 @@ def _adx(h: pd.Series, l: pd.Series, c: pd.Series, n: int = 14) -> pd.Series:
     dim  = dm_minus.ewm(alpha=1/n, adjust=False).mean() / atr14 * 100
     dx   = ((dip - dim).abs() / (dip + dim).replace(0, np.nan) * 100).fillna(0)
     return dx.ewm(alpha=1/n, adjust=False).mean()
+
+def find_fvg(df: pd.DataFrame):
+    """Ищет Fair Value Gap (Имбаланс) в последних 3 свечах"""
+    if df['h'].iloc[-3] < df['l'].iloc[-1]:
+        return 'bullish', df['l'].iloc[-1]
+    if df['l'].iloc[-3] > df['h'].iloc[-1]:
+        return 'bearish', df['h'].iloc[-1]
+    return None, 0
+
+def is_liquidity_sweep(df: pd.DataFrame, side: str):
+    """Проверяет, был ли ложный вынос ликвидности (снятие стопов)"""
+    last_low = df['l'].iloc[-1]
+    last_high = df['h'].iloc[-1]
+    prev_min = df['l'].iloc[-6:-1].min()
+    prev_max = df['h'].iloc[-6:-1].max()
+    
+    if side == 'long':
+        return last_low < prev_min and df['c'].iloc[-1] > prev_min
+    else:
+        return last_high > prev_max and df['c'].iloc[-1] < prev_max
 
 # =====================================================================
 # БАЗА ДАННЫХ (Атомарные транзакции)
@@ -189,7 +210,7 @@ def is_correlated_with_btc(symbol: str, btc_closes: pd.Series) -> bool:
     except: return False
 
 def analyze_1h(symbol: str, btc_closes: pd.Series | None = None):
-    """Стратегия 1: Глобальный вход на 1H свечах"""
+    """Стратегия 1: Глобальный вход на 1H свечах с жестким фильтром"""
     if btc_closes is not None and is_correlated_with_btc(symbol, btc_closes): return None
 
     df4h = pd.DataFrame(exchange.fetch_ohlcv(symbol, '4h', limit=200), columns=['ts', 'o', 'h', 'l', 'c', 'v'])
@@ -199,7 +220,7 @@ def analyze_1h(symbol: str, btc_closes: pd.Series | None = None):
 
     try:
         adx_val = _adx(df4h['h'], df4h['l'], df4h['c'], 14).iloc[-2]
-        if not pd.isna(adx_val) and adx_val < 25: return None
+        if not pd.isna(adx_val) and adx_val < ADX_THRESHOLD: return None
     except: pass
 
     df1h = pd.DataFrame(exchange.fetch_ohlcv(symbol, '1h', limit=60), columns=['ts', 'o', 'h', 'l', 'c', 'v'])
@@ -222,37 +243,38 @@ def analyze_1h(symbol: str, btc_closes: pd.Series | None = None):
     return {'symbol': symbol, 'price': c.iloc[-2], 'atr': atr_val, 'side': side, 'strategy': 'ema_1h'}
 
 def analyze_15m(symbol: str, btc_closes: pd.Series | None = None):
-    """Стратегия 2: Снайперский вход на 15m с подтверждением старших ТФ"""
+    """Стратегия 2: Smart Money (Поиск снятия ликвидности и FVG)"""
     if btc_closes is not None and is_correlated_with_btc(symbol, btc_closes): return None
 
     df4h = pd.DataFrame(exchange.fetch_ohlcv(symbol, '4h', limit=100), columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-    ema50_4h = _ema(df4h['c'], 50).iloc[-2]
-    if pd.isna(ema50_4h): return None
-    above_ema50_4h = df4h['c'].iloc[-2] > ema50_4h
-
-    df1h = pd.DataFrame(exchange.fetch_ohlcv(symbol, '1h', limit=60), columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-    e12_1h = _ema(df1h['c'], 12).iloc[-2]; e26_1h = _ema(df1h['c'], 26).iloc[-2]
-    if pd.isna(e12_1h) or pd.isna(e26_1h): return None
-    bull_1h = e12_1h > e26_1h
+    try:
+        adx_val = _adx(df4h['h'], df4h['l'], df4h['c'], 14).iloc[-2]
+        if not pd.isna(adx_val) and adx_val < ADX_THRESHOLD: return None
+    except: pass
 
     df15m = pd.DataFrame(exchange.fetch_ohlcv(symbol, '15m', limit=60), columns=['ts', 'o', 'h', 'l', 'c', 'v'])
     c = df15m['c']; h = df15m['h']; l = df15m['l']; v = df15m['v']
-    atr_val = _atr(h, l, c, 14).iloc[-2]
-    e12_15 = _ema(c, 12).iloc[-2]; e26_15 = _ema(c, 26).iloc[-2]
+    
+    atr_val = _atr(h, l, c, 14).iloc[-1]
+    e12_15 = _ema(c, 12).iloc[-1]
+    e26_15 = _ema(c, 26).iloc[-1]
 
     if pd.isna(atr_val) or pd.isna(e12_15) or pd.isna(e26_15) or atr_val <= 0: return None
-    if (atr_val / c.iloc[-2]) * 100 < (MIN_NATR * 0.5): return None
+    if (atr_val / c.iloc[-1]) * 100 < (MIN_NATR * 0.5): return None
 
-    if above_ema50_4h and bull_1h and e12_15 > e26_15: side = 'long'
-    elif not above_ema50_4h and not bull_1h and e12_15 < e26_15: side = 'short'
-    else: return None
+    # Определяем направление тренда
+    trend_side = 'long' if e12_15 > e26_15 else 'short'
 
-    vol_ma = v.rolling(20).mean()
-    if sum([v.iloc[-2] > v.iloc[-3] > v.iloc[-4], 
-            (c.iloc[-2] > c.iloc[-3]) if side=='long' else (c.iloc[-2] < c.iloc[-3]), 
-            v.iloc[-2] > vol_ma.iloc[-2] * 1.5]) < 2: return None
+    # Проверяем вынос ликвидности (стопов толпы)
+    if not is_liquidity_sweep(df15m, trend_side):
+        return None
 
-    return {'symbol': symbol, 'price': c.iloc[-2], 'atr': atr_val, 'side': side, 'strategy': 'ema_multi_15m'}
+    # Подтверждаем силу движения через Имбаланс (FVG)
+    fvg_type, _ = find_fvg(df15m)
+    if fvg_type != trend_side:
+        return None
+
+    return {'symbol': symbol, 'price': c.iloc[-1], 'atr': atr_val, 'side': trend_side, 'strategy': 'smart_15m'}
 
 def open_trade(setup: dict) -> bool:
     symbol = setup['symbol']
@@ -285,7 +307,7 @@ def open_trade(setup: dict) -> bool:
         return False
 
     tp1 = setup['price'] - sl_dist * 2.5 if setup['side'] == 'short' else setup['price'] + sl_dist * 2.5
-    icon = '⏱️' if setup['strategy'] == 'ema_multi_15m' else '🕰️'
+    icon = '⏱️' if '15m' in setup['strategy'] else '🕰️'
     bot.send_message(USER_ID, 
         f'{icon} *ВХОД ({setup["strategy"]}): {symbol}*\n'
         f'Тип: *{setup["side"].upper()}* | Цена: `{setup["price"]:.6g}`\n'
@@ -359,7 +381,7 @@ async def monitor_trades():
                                 _write_db_transaction(queries)
                                 await asyncio.to_thread(bot.send_message, USER_ID, f'🎯 *50% ТЕЙК: {symbol}* | PnL: `+{net_pnl:.2f}`', parse_mode='Markdown')
                         else:
-                            tf = '15m' if strategy == 'ema_multi_15m' else '1h'
+                            tf = '15m' if '15m' in strategy else '1h'
                             df_tr = pd.DataFrame(await asyncio.to_thread(exchange.fetch_ohlcv, symbol, tf, limit=20), columns=['ts', 'o', 'h', 'l', 'c', 'v'])
                             atr = _atr(df_tr['h'], df_tr['l'], df_tr['c'], 14).iloc[-1]
                             new_tsl = max(trailing_sl, price - atr * 1.0)
@@ -387,7 +409,7 @@ async def monitor_trades():
                                 _write_db_transaction(queries)
                                 await asyncio.to_thread(bot.send_message, USER_ID, f'🎯 *50% ТЕЙК: {symbol}* | PnL: `+{net_pnl:.2f}`', parse_mode='Markdown')
                         else:
-                            tf = '15m' if strategy == 'ema_multi_15m' else '1h'
+                            tf = '15m' if '15m' in strategy else '1h'
                             df_tr = pd.DataFrame(await asyncio.to_thread(exchange.fetch_ohlcv, symbol, tf, limit=20), columns=['ts', 'o', 'h', 'l', 'c', 'v'])
                             atr = _atr(df_tr['h'], df_tr['l'], df_tr['c'], 14).iloc[-1]
                             new_tsl = min(trailing_sl, price + atr * 1.0)
@@ -424,7 +446,7 @@ async def hunter_15m():
     await asyncio.sleep(seconds_until_next_grid(GRID_15M_MINUTES))
     while True:
         try:
-            log.info('[Scanner] Запуск 15m сканера')
+            log.info('[Scanner] Запуск 15m сканера (SMART)')
             tickers = await asyncio.to_thread(exchange.fetch_tickers)
             candidates = [s for s, d in tickers.items() if '/USDT:USDT' in s and s not in BLACKLIST and (d.get('quoteVolume') or 0) >= MIN_VOLUME_24H]
             btc_closes = await asyncio.to_thread(fetch_btc_closes)
@@ -449,7 +471,7 @@ def main_keyboard():
 
 @bot.message_handler(commands=['start'])
 def cmd_start(msg):
-    bot.send_message(USER_ID, '🛡️ *Fortress Dual-Core*\nA/B Тест: 1H против 15m. Изоляция позиций.', parse_mode='Markdown', reply_markup=main_keyboard())
+    bot.send_message(USER_ID, '🛡️ *Fortress Dual-Core*\nТест: 1H (Тренд) против 15m (Smart Money).', parse_mode='Markdown', reply_markup=main_keyboard())
 
 @bot.message_handler(func=lambda m: m.text == '💰 БАЛАНС')
 def cmd_balance(msg):
@@ -469,10 +491,7 @@ def cmd_balance(msg):
 def cmd_trades(msg):
     def _run():
         try:
-            trades = _read_db(
-                'SELECT symbol,side,entry_price,sl,is_trailing,trailing_sl,entry_time,size,strategy '
-                'FROM active_trades'
-            )
+            trades = _read_db('SELECT symbol,side,entry_price,sl,is_trailing,trailing_sl,entry_time,size,strategy FROM active_trades')
             if not trades:
                 bot.send_message(USER_ID, '⚔️ Активных сделок нет.')
                 return
@@ -481,16 +500,13 @@ def cmd_trades(msg):
             for sym, side, ep, sl, is_tr, tsl, et, sz, strategy in trades:
                 t = et[5:16] if et else '—'
                 icon = '⏱️' if '15m' in strategy else '🕰️'
-                
-                # Экранируем подчеркивания в названии стратегии для Markdown
                 safe_strategy = strategy.replace('_', '\\_')
                 
                 try:
                     cur_price = exchange.fetch_ticker(sym)['last']
                     net_pnl = ((cur_price - ep) * sz if side == 'long' else (ep - cur_price) * sz) - ((ep * sz * FEE_RATE) + (cur_price * sz * FEE_RATE))
                     pnl_str = f'{"🟢" if net_pnl >= 0 else "🔴"} PnL: `{net_pnl:+.2f}` | Цена: `{cur_price:.6g}`\n  '
-                except: 
-                    pnl_str = ''
+                except: pnl_str = ''
 
                 if is_tr:
                     mode = f'📍 T-SL: `{tsl:.6g}`\n  🔴 SL: `{sl:.6g}`'
@@ -499,18 +515,13 @@ def cmd_trades(msg):
                     mode = f'🎯 TP1: `{tp1:.6g}`\n  🔴 SL: `{sl:.6g}`'
                     
                 text += f'{icon} *{sym}* ({safe_strategy}) | {side.upper()} | {t}\n  {pnl_str}{mode}\n\n'
-            
-            # Финальная защита от падения Telegram API
-            try:
-                bot.send_message(USER_ID, text, parse_mode='Markdown')
+                
+            try: bot.send_message(USER_ID, text, parse_mode='Markdown')
             except:
-                # Если Markdown всё равно не пролез, шлем простым текстом
                 clean_text = text.replace('*', '').replace('`', '').replace('\\_', '_')
                 bot.send_message(USER_ID, clean_text)
-                
         except Exception as e:
             log.error(f'[UI Error] Ошибка кнопки сделок: {e}', exc_info=True)
-            
     thread_pool.submit(_run)
 
 @bot.message_handler(func=lambda m: m.text == '📈 СТАТИСТИКА')
@@ -518,7 +529,7 @@ def cmd_stats(msg):
     def _run():
         rows = _read_db('SELECT net_pnl, result, strategy FROM trade_log')
         if not rows:
-            bot.send_message(USER_ID, 'Сделок нет.')
+            bot.send_message(USER_ID, '📈 Закрытых сделок пока нет.')
             return
         
         def calc_stats(data):
@@ -526,16 +537,19 @@ def cmd_stats(msg):
             total = len(data)
             wins = sum(1 for r in data if r[1] == 'WIN')
             pnl = sum(r[0] for r in data)
-            return f'Сделок: `{total}` | WR: `{wins/total*100:.1f}%`\nPnL: `{pnl:+.2f}` USDT'
+            gp = sum(r[0] for r in data if r[0] > 0)
+            gl = abs(sum(r[0] for r in data if r[0] < 0))
+            pf = gp / gl if gl > 0 else (gp if gp > 0 else 0)
+            return f'Сделок: `{total}` | WR: `{wins/total*100:.1f}%` | PF: `{pf:.2f}`\nPnL: `{pnl:+.2f}` USDT'
 
-        stats_1h = calc_stats([r for r in rows if r[2] == 'ema_1h'])
-        stats_15m = calc_stats([r for r in rows if r[2] == 'ema_multi_15m'])
+        stats_1h = calc_stats([r for r in rows if '1h' in r[2]])
+        stats_15m = calc_stats([r for r in rows if '15m' in r[2]])
         overall_pnl = sum(r[0] for r in rows)
 
         bot.send_message(USER_ID, 
-            f'📈 *A/B ТЕСТИРОВАНИЕ*\n\n'
-            f'🕰️ *Стратегия 1H*\n{stats_1h}\n\n'
-            f'⏱️ *Стратегия 15m*\n{stats_15m}\n\n'
+            f'📈 *A/B ТЕСТИРОВАНИЕ (SMART)*\n\n'
+            f'🕰️ *Стратегия 1H (Тренд)*\n{stats_1h}\n\n'
+            f'⏱️ *Стратегия 15m (Smart)*\n{stats_15m}\n\n'
             f'───────────────\n'
             f'🏆 Итоговый PnL: `{overall_pnl:+.2f}` USDT', 
             parse_mode='Markdown')
@@ -543,13 +557,57 @@ def cmd_stats(msg):
 
 @bot.message_handler(func=lambda m: m.text == '🚪 ЗАКРЫТЬ ВСЕ')
 def cmd_close_all(msg):
-    bot.send_message(USER_ID, 'Закрываю...')
-    def _run():
-        trades = _read_db('SELECT id,symbol,side,entry_price,size,sl,tp,is_trailing,trailing_sl,partial_price,entry_time,strategy FROM active_trades')
-        for t in trades:
-            try: close_trade(t, exchange.fetch_ticker(t[1])['last'], '🚪 Ручное закрытие')
-            except: pass
-    thread_pool.submit(_run)
+    # Создаем inline-кнопки под сообщением
+    markup = types.InlineKeyboardMarkup()
+    btn_yes = types.InlineKeyboardButton('⚠️ ДА, ЗАКРЫТЬ ВСЕ', callback_data='confirm_close_all')
+    btn_no = types.InlineKeyboardButton('❌ Отмена', callback_data='cancel_close_all')
+    markup.add(btn_yes, btn_no)
+    
+    bot.send_message(
+        USER_ID, 
+        'Вы уверены, что хотите закрыть **ВСЕ** активные сделки по текущей рыночной цене?', 
+        parse_mode='Markdown', 
+        reply_markup=markup
+    )
+
+# Обработчик нажатий на inline-кнопки
+@bot.callback_query_handler(func=lambda call: call.data in ['confirm_close_all', 'cancel_close_all'])
+def callback_close_all(call):
+    # Убираем часики на кнопке в самом клиенте Telegram
+    bot.answer_callback_query(call.id) 
+    
+    if call.data == 'cancel_close_all':
+        bot.edit_message_text(
+            'Действие отменено. Сделки продолжают работу.', 
+            chat_id=call.message.chat.id, 
+            message_id=call.message.message_id
+        )
+        return
+
+    if call.data == 'confirm_close_all':
+        bot.edit_message_text(
+            '⏳ Выполняю экстренное закрытие всех позиций...', 
+            chat_id=call.message.chat.id, 
+            message_id=call.message.message_id
+        )
+        
+        def _run():
+            trades = _read_db('SELECT id,symbol,side,entry_price,size,sl,tp,is_trailing,trailing_sl,partial_price,entry_time,strategy FROM active_trades')
+            if not trades:
+                bot.send_message(USER_ID, 'Нет активных сделок для закрытия.')
+                return
+                
+            closed_count = 0
+            for t in trades:
+                try: 
+                    close_trade(t, exchange.fetch_ticker(t[1])['last'], '🚪 Ручное закрытие')
+                    closed_count += 1
+                except Exception as e: 
+                    log.error(f'[Manual Close Error] {t[1]}: {e}')
+                    
+            bot.send_message(USER_ID, f'✅ Успешно закрыто позиций: `{closed_count}`.', parse_mode='Markdown')
+            
+        thread_pool.submit(_run)
 
 # =====================================================================
 # ЗАПУСК
@@ -563,7 +621,7 @@ async def main_async():
 
 if __name__ == '__main__':
     init_db()
-    log.info('🛡️ Fortress Dual-Core запущен')
+    log.info('🛡️ Fortress Dual-Core (Smart) запущен')
     threading.Thread(target=db_worker, daemon=True).start()
     threading.Thread(target=lambda: asyncio.run(main_async()), daemon=True).start()
     while True:
