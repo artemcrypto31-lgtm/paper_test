@@ -47,8 +47,9 @@ USER_ID = int(os.getenv('USER_ID'))
 
 STARTING_BALANCE  = 1000.0
 MIN_VOLUME_24H    = 120_000_000.0
-MIN_NATR          = 1.5       # Увеличена волатильность для защиты от пилы
-ADX_THRESHOLD     = 30        # Жесткий фильтр тренда
+MIN_NATR          = 1.5       # Защита от пилы
+ADX_1H_THRESHOLD  = 30        # Жесткий фильтр тренда для 1H
+ADX_15M_THRESHOLD = 20        # Смягченный фильтр тренда для Smart Money 15m
 RISK_PER_TRADE    = 0.01      
 ATR_MULT_SL       = 2.0       
 MONITOR_INTERVAL  = 60        
@@ -91,25 +92,20 @@ def _adx(h: pd.Series, l: pd.Series, c: pd.Series, n: int = 14) -> pd.Series:
     dx   = ((dip - dim).abs() / (dip + dim).replace(0, np.nan) * 100).fillna(0)
     return dx.ewm(alpha=1/n, adjust=False).mean()
 
-def find_fvg(df: pd.DataFrame):
-    """Ищет Fair Value Gap (Имбаланс) в последних 3 свечах"""
-    if df['h'].iloc[-3] < df['l'].iloc[-1]:
-        return 'bullish', df['l'].iloc[-1]
-    if df['l'].iloc[-3] > df['h'].iloc[-1]:
-        return 'bearish', df['h'].iloc[-1]
-    return None, 0
-
 def is_liquidity_sweep(df: pd.DataFrame, side: str):
-    """Проверяет, был ли ложный вынос ликвидности (снятие стопов)"""
-    last_low = df['l'].iloc[-1]
-    last_high = df['h'].iloc[-1]
-    prev_min = df['l'].iloc[-6:-1].min()
-    prev_max = df['h'].iloc[-6:-1].max()
-    
-    if side == 'long':
-        return last_low < prev_min and df['c'].iloc[-1] > prev_min
-    else:
-        return last_high > prev_max and df['c'].iloc[-1] < prev_max
+    """Ищет снятие ликвидности в последних 3-х закрытых свечах"""
+    for i in range(-3, 0):
+        curr_l, curr_h, curr_c = df['l'].iloc[i], df['h'].iloc[i], df['c'].iloc[i]
+        prev_l = df['l'].iloc[-18:i].min() if i < -1 else df['l'].iloc[-18:-1].min()
+        prev_h = df['h'].iloc[-18:i].max() if i < -1 else df['h'].iloc[-18:-1].max()
+        
+        if side == 'long':
+            # Прокол локального дна и закрытие выше него (Rejection)
+            if curr_l < prev_l and curr_c > prev_l: return True
+        else:
+            # Прокол локального хая и закрытие ниже него
+            if curr_h > prev_h and curr_c < prev_h: return True
+    return False
 
 # =====================================================================
 # БАЗА ДАННЫХ (Атомарные транзакции)
@@ -210,7 +206,7 @@ def is_correlated_with_btc(symbol: str, btc_closes: pd.Series) -> bool:
     except: return False
 
 def analyze_1h(symbol: str, btc_closes: pd.Series | None = None):
-    """Стратегия 1: Глобальный вход на 1H свечах с жестким фильтром"""
+    """Стратегия 1: Глобальный тренд 1H"""
     if btc_closes is not None and is_correlated_with_btc(symbol, btc_closes): return None
 
     df4h = pd.DataFrame(exchange.fetch_ohlcv(symbol, '4h', limit=200), columns=['ts', 'o', 'h', 'l', 'c', 'v'])
@@ -220,7 +216,7 @@ def analyze_1h(symbol: str, btc_closes: pd.Series | None = None):
 
     try:
         adx_val = _adx(df4h['h'], df4h['l'], df4h['c'], 14).iloc[-2]
-        if not pd.isna(adx_val) and adx_val < ADX_THRESHOLD: return None
+        if not pd.isna(adx_val) and adx_val < ADX_1H_THRESHOLD: return None
     except: pass
 
     df1h = pd.DataFrame(exchange.fetch_ohlcv(symbol, '1h', limit=60), columns=['ts', 'o', 'h', 'l', 'c', 'v'])
@@ -243,17 +239,17 @@ def analyze_1h(symbol: str, btc_closes: pd.Series | None = None):
     return {'symbol': symbol, 'price': c.iloc[-2], 'atr': atr_val, 'side': side, 'strategy': 'ema_1h'}
 
 def analyze_15m(symbol: str, btc_closes: pd.Series | None = None):
-    """Стратегия 2: Smart Money (Поиск снятия ликвидности и FVG)"""
+    """Стратегия 2: Smart Money 15m (Ликвидность)"""
     if btc_closes is not None and is_correlated_with_btc(symbol, btc_closes): return None
 
     df4h = pd.DataFrame(exchange.fetch_ohlcv(symbol, '4h', limit=100), columns=['ts', 'o', 'h', 'l', 'c', 'v'])
     try:
         adx_val = _adx(df4h['h'], df4h['l'], df4h['c'], 14).iloc[-2]
-        if not pd.isna(adx_val) and adx_val < ADX_THRESHOLD: return None
+        if not pd.isna(adx_val) and adx_val < ADX_15M_THRESHOLD: return None
     except: pass
 
     df15m = pd.DataFrame(exchange.fetch_ohlcv(symbol, '15m', limit=60), columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-    c = df15m['c']; h = df15m['h']; l = df15m['l']; v = df15m['v']
+    c = df15m['c']; h = df15m['h']; l = df15m['l']
     
     atr_val = _atr(h, l, c, 14).iloc[-1]
     e12_15 = _ema(c, 12).iloc[-1]
@@ -262,16 +258,9 @@ def analyze_15m(symbol: str, btc_closes: pd.Series | None = None):
     if pd.isna(atr_val) or pd.isna(e12_15) or pd.isna(e26_15) or atr_val <= 0: return None
     if (atr_val / c.iloc[-1]) * 100 < (MIN_NATR * 0.5): return None
 
-    # Определяем направление тренда
     trend_side = 'long' if e12_15 > e26_15 else 'short'
 
-    # Проверяем вынос ликвидности (стопов толпы)
     if not is_liquidity_sweep(df15m, trend_side):
-        return None
-
-    # Подтверждаем силу движения через Имбаланс (FVG)
-    fvg_type, _ = find_fvg(df15m)
-    if fvg_type != trend_side:
         return None
 
     return {'symbol': symbol, 'price': c.iloc[-1], 'atr': atr_val, 'side': trend_side, 'strategy': 'smart_15m'}
@@ -461,7 +450,7 @@ async def hunter_15m():
         await asyncio.sleep(seconds_until_next_grid(GRID_15M_MINUTES))
 
 # =====================================================================
-# TELEGRAM БОТ (Команды)
+# TELEGRAM БОТ (Команды и Интерфейс)
 # =====================================================================
 def main_keyboard():
     m = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -491,13 +480,16 @@ def cmd_balance(msg):
 def cmd_trades(msg):
     def _run():
         try:
-            trades = _read_db('SELECT symbol,side,entry_price,sl,is_trailing,trailing_sl,entry_time,size,strategy FROM active_trades')
+            trades = _read_db('SELECT id,symbol,side,entry_price,sl,is_trailing,trailing_sl,entry_time,size,strategy FROM active_trades')
             if not trades:
                 bot.send_message(USER_ID, '⚔️ Активных сделок нет.')
                 return
                 
             text = '⚔️ *АКТИВНЫЕ СДЕЛКИ:*\n\n'
-            for sym, side, ep, sl, is_tr, tsl, et, sz, strategy in trades:
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            buttons = []
+            
+            for tid, sym, side, ep, sl, is_tr, tsl, et, sz, strategy in trades:
                 t = et[5:16] if et else '—'
                 icon = '⏱️' if '15m' in strategy else '🕰️'
                 safe_strategy = strategy.replace('_', '\\_')
@@ -505,23 +497,43 @@ def cmd_trades(msg):
                 try:
                     cur_price = exchange.fetch_ticker(sym)['last']
                     net_pnl = ((cur_price - ep) * sz if side == 'long' else (ep - cur_price) * sz) - ((ep * sz * FEE_RATE) + (cur_price * sz * FEE_RATE))
-                    pnl_str = f'{"🟢" if net_pnl >= 0 else "🔴"} PnL: `{net_pnl:+.2f}` | Цена: `{cur_price:.6g}`\n  '
-                except: pnl_str = ''
+                    pnl_str = f'{"🟢" if net_pnl >= 0 else "🔴"} PnL: `{net_pnl:+.2f}`\n  📥 Вход: `{ep:.6g}` | Текущая: `{cur_price:.6g}`'
+                except: pnl_str = f'📥 Вход: `{ep:.6g}` | Текущая: `ошибка API`'
 
                 if is_tr:
-                    mode = f'📍 T-SL: `{tsl:.6g}`\n  🔴 SL: `{sl:.6g}`'
+                    mode = f'\n  📍 T-SL: `{tsl:.6g}`\n  🔴 SL: `{sl:.6g}`'
                 else:
                     tp1 = ep + (ep - sl) * 2.5 if side == 'long' else ep - (sl - ep) * 2.5
-                    mode = f'🎯 TP1: `{tp1:.6g}`\n  🔴 SL: `{sl:.6g}`'
+                    mode = f'\n  🎯 TP1: `{tp1:.6g}`\n  🔴 SL: `{sl:.6g}`'
                     
                 text += f'{icon} *{sym}* ({safe_strategy}) | {side.upper()} | {t}\n  {pnl_str}{mode}\n\n'
                 
-            try: bot.send_message(USER_ID, text, parse_mode='Markdown')
+                clean_sym = sym.replace('/USDT:USDT', '')
+                buttons.append(types.InlineKeyboardButton(f'✖️ {clean_sym}', callback_data=f'kill_{tid}'))
+                
+            markup.add(*buttons)
+            
+            try: bot.send_message(USER_ID, text, parse_mode='Markdown', reply_markup=markup)
             except:
                 clean_text = text.replace('*', '').replace('`', '').replace('\\_', '_')
-                bot.send_message(USER_ID, clean_text)
+                bot.send_message(USER_ID, clean_text, reply_markup=markup)
         except Exception as e:
             log.error(f'[UI Error] Ошибка кнопки сделок: {e}', exc_info=True)
+    thread_pool.submit(_run)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('kill_'))
+def callback_kill_trade(call):
+    trade_id = int(call.data.split('_')[1])
+    bot.answer_callback_query(call.id, "Отправлен сигнал на закрытие...")
+    
+    def _run():
+        trade = _read_db('SELECT id,symbol,side,entry_price,size,sl,tp,is_trailing,trailing_sl,partial_price,entry_time,strategy FROM active_trades WHERE id=?', (trade_id,), fetchone=True)
+        if trade:
+            try:
+                close_trade(trade, exchange.fetch_ticker(trade[1])['last'], '🎯 Точечное ручное закрытие')
+                bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
+            except Exception as e:
+                log.error(f'[Manual Kill Error] {trade[1]}: {e}')
     thread_pool.submit(_run)
 
 @bot.message_handler(func=lambda m: m.text == '📈 СТАТИСТИКА')
@@ -557,7 +569,6 @@ def cmd_stats(msg):
 
 @bot.message_handler(func=lambda m: m.text == '🚪 ЗАКРЫТЬ ВСЕ')
 def cmd_close_all(msg):
-    # Создаем inline-кнопки под сообщением
     markup = types.InlineKeyboardMarkup()
     btn_yes = types.InlineKeyboardButton('⚠️ ДА, ЗАКРЫТЬ ВСЕ', callback_data='confirm_close_all')
     btn_no = types.InlineKeyboardButton('❌ Отмена', callback_data='cancel_close_all')
@@ -570,10 +581,8 @@ def cmd_close_all(msg):
         reply_markup=markup
     )
 
-# Обработчик нажатий на inline-кнопки
 @bot.callback_query_handler(func=lambda call: call.data in ['confirm_close_all', 'cancel_close_all'])
 def callback_close_all(call):
-    # Убираем часики на кнопке в самом клиенте Telegram
     bot.answer_callback_query(call.id) 
     
     if call.data == 'cancel_close_all':
