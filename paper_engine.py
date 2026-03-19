@@ -362,10 +362,22 @@ def close_trade(trade: tuple, exit_price: float, reason: str):
 
     new_balance = _read_db('SELECT balance FROM wallet', fetchone=True)[0]
     icon = '🏆' if result == 'WIN' else '💀'
-    bot.send_message(USER_ID,
-        f'{icon} *ЗАКРЫТО: {symbol}* ({strategy})\n{reason} | {side.upper()} → `{exit_price:.6g}`\n'
-        f'Чистый PnL: `{net_pnl:+.2f}` USDT (Комиссия: `{total_fee:.2f}`)\nБаланс: `{new_balance:.2f}` USDT',
-        parse_mode='Markdown')
+    
+    # Защита от сбоев Telegram API (экранирование)
+    safe_strategy = strategy.replace('_', '\\_')
+    
+    msg_text = (f'{icon} *ЗАКРЫТО: {symbol}* ({safe_strategy})\n'
+                f'{reason} | {side.upper()} → `{exit_price:.6g}`\n'
+                f'Чистый PnL: `{net_pnl:+.2f}` USDT (Комиссия: `{total_fee:.2f}`)\n'
+                f'Баланс: `{new_balance:.2f}` USDT')
+    
+    try:
+        bot.send_message(USER_ID, msg_text, parse_mode='Markdown')
+    except Exception as e:
+        log.error(f'[UI Error] Сбой отправки Markdown для {symbol}: {e}')
+        # Отправка сырого текста, если Markdown выдал ошибку
+        clean_text = msg_text.replace('*', '').replace('`', '').replace('\\_', '_')
+        bot.send_message(USER_ID, clean_text)
 
 # =====================================================================
 # АСИНХРОННЫЕ ВОРКЕРЫ
